@@ -647,6 +647,21 @@ pub const StoredResponse = struct {
     /// the arena (including all inner []const u8 slices and tool_calls).
     history: []chat_mod.Message,
 
+    /// Exact model-visible continuation frontier for Hermes' qwen-late mode.
+    /// This includes the prompt, generated assistant tokens, and a synthetic
+    /// closing `<|im_end|>` when generation stopped before emitting its EOS.
+    /// Keeping this beside the transcript lets a later Responses turn append
+    /// only its user/tool delta while changing the current tool policy without
+    /// re-rendering or invalidating the durable prefix.
+    qwen_late_tokens: []u32 = &.{},
+    qwen_late: bool = false,
+    qwen_late_has_vision: bool = false,
+    qwen_late_has_non_image_media: bool = false,
+    durable_instructions: []u8 = &.{},
+    runtime_instructions: []u8 = &.{},
+    reasoning_effort: []u8 = &.{},
+    enable_thinking: bool = false,
+
     arena: std.heap.ArenaAllocator,
 
     list_node: std.DoublyLinkedList.Node = .{},

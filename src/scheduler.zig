@@ -239,6 +239,10 @@ pub const SubmitParams = struct {
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
+    /// Prefix-cache identity for tool state. Normally follows `has_tools`.
+    /// Token-authentic late-tool renderers may pin this because their schema
+    /// already participates in exact prompt-token matching.
+    cache_has_tools: ?bool = null,
     /// The server's final resolved thinking mode after request overrides and
     /// model defaults. DFlash economics key off this, not tool presence.
     enable_thinking: bool = false,
@@ -291,6 +295,10 @@ pub const SubmitParams = struct {
     /// post-Phase-D; tests using the legacy path pass the default model.
     model: *model_registry_mod.LoadedModel,
 };
+
+fn resolvedCacheHasTools(has_tools: bool, override: ?bool) bool {
+    return override orelse has_tools;
+}
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -374,6 +382,7 @@ pub const Slot = struct {
     max_tokens: u32,
     timeout_ns: u64,
     has_tools: bool,
+    cache_has_tools: bool = false,
     enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
@@ -551,6 +560,7 @@ pub const Slot = struct {
             .max_tokens = params.max_tokens,
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
+            .cache_has_tools = resolvedCacheHasTools(params.has_tools, params.cache_has_tools),
             .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
             // Qwen's external drafter does not yet carry M-RoPE positions.
@@ -4422,7 +4432,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         };
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithState(&slot.cache, total_tokens, slot.cache_has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4462,7 +4472,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     if (slot.ssm_entries != null) return;
     const step: usize = @intCast(slot.cache.step);
     const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
-    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, null, null, null) catch |err| {
+    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.cache_has_tools, slot.vision_key, null, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5143,7 +5153,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.ssm_entries,
                 xfm_ptr.s,
                 slot.full_prompt,
-                slot.has_tools,
+                slot.cache_has_tools,
                 slot.vision_key,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
@@ -5853,7 +5863,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
         calls += 1;
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+            std.mem.indexOf(u8, line, ", false, null, false, use_pld") != null);
     }
     try testing.expectEqual(@as(usize, 4), calls);
 }
@@ -6732,4 +6742,11 @@ test "the ANE build resolves its chunk through effectivePrefillChunk, never the 
     const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
     const window_start = call_at -| 1200;
     try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
+}
+
+test "prefix cache tool identity can follow tokens instead of generation policy" {
+    try testing.expect(!resolvedCacheHasTools(false, null));
+    try testing.expect(resolvedCacheHasTools(true, null));
+    try testing.expect(!resolvedCacheHasTools(true, false));
+    try testing.expect(resolvedCacheHasTools(false, true));
 }

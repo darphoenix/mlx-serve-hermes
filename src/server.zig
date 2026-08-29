@@ -867,6 +867,12 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
+/// Hermes compatibility mode for Qwen ChatML models. Responses prompts keep
+/// durable conversation tokens first and append the current turn's transient
+/// runtime policy and tool schemas immediately before the assistant prefix.
+/// Disabled by default so upstream prompt semantics remain unchanged.
+pub var hermes_qwen_late: bool = false;
+
 /// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
 /// sessions per loaded GGUF model. 1 is the legacy single-session
 /// behavior (a flip between two long-doc prompts evicts the other on
@@ -5800,7 +5806,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, null, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6107,6 +6113,7 @@ fn nonStreamingViaScheduler(
     eos_token_ids: []const u32,
     cached_tokens: u32,
     has_tools: bool,
+    cache_has_tools: ?bool,
     enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
@@ -6130,6 +6137,7 @@ fn nonStreamingViaScheduler(
         .full_prompt = full_prompt,
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
+        .cache_has_tools = cache_has_tools,
         .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
@@ -6281,7 +6289,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -6776,6 +6784,27 @@ const StreamingTokenStream = struct {
         }
     }
 };
+
+fn streamingGenerationResult(
+    text: []u8,
+    token_ids: []u32,
+    ts: StreamingTokenStream,
+    stopped: bool,
+) generate_mod.GenerationResult {
+    return .{
+        .text = text,
+        .token_ids = token_ids,
+        .prompt_tokens = ts.prompt_tokens,
+        .cached_tokens = ts.cached_tokens,
+        .completion_tokens = ts.completion_tokens,
+        .finish_reason = if (stopped) "stop" else ts.finish_reason,
+        .finish_details = ts.finish_details,
+        .prefill_tps = generate_mod.prefillTokensPerSec(ts.prompt_tokens, ts.cached_tokens, ts.prefill_ns),
+        .decode_tps = generate_mod.tokensPerSec(ts.completion_tokens, ts.decode_ns),
+        .prefill_ns = ts.prefill_ns,
+        .decode_ns = ts.decode_ns,
+    };
+}
 
 /// Choose the speculative-decoding mode for a streaming request based on
 /// the request flags and the model capabilities. Mirrors the dispatch in
@@ -11268,7 +11297,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -12313,6 +12342,260 @@ fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
     return parsed.value == .object;
 }
 
+const HERMES_RUNTIME_INSTRUCTIONS_EXPIRED =
+    "[The internal runtime directive for the preceding assistant response has expired. " ++
+    "Continue under the durable system instructions and the current tool policy. " ++
+    "Do not repeat the prior repair action unless the current evidence independently requires it.]";
+
+fn hermesQwenLateRequested(root: std.json.ObjectMap) bool {
+    if (root.get("hermes_qwen_late")) |v| {
+        if (v == .bool) return v.bool;
+    }
+    return hermes_qwen_late;
+}
+
+fn hermesRuntimeInstructions(root: std.json.ObjectMap) []const u8 {
+    const value = root.get("hermes_runtime_instructions") orelse return "";
+    return if (value == .string) std.mem.trim(u8, value.string, " \t\r\n") else "";
+}
+
+fn isHermesQwenLateTemplate(chat_template: []const u8) bool {
+    return std.mem.indexOf(u8, chat_template, "<|im_start|>") != null and
+        std.mem.indexOf(u8, chat_template, "<|im_end|>") != null and
+        std.mem.indexOf(u8, chat_template, "<tool_response>") != null and
+        std.mem.indexOf(u8, chat_template, "<function=") != null;
+}
+
+fn tokenSliceEndsWith(tokens: []const u32, suffix: []const u32) bool {
+    return suffix.len <= tokens.len and std.mem.eql(u32, tokens[tokens.len - suffix.len ..], suffix);
+}
+
+fn qwenLateGenerationTail(enable_thinking: bool) []const u8 {
+    return if (enable_thinking)
+        "<|im_start|>assistant\n<think>\n"
+    else
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+}
+
+fn appendHermesRuntimeBlock(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    runtime_instructions: []const u8,
+    previous_runtime_instructions: []const u8,
+    leading_newline: bool,
+) !void {
+    const current = std.mem.trim(u8, runtime_instructions, " \t\r\n");
+    const expired = current.len == 0 and previous_runtime_instructions.len > 0;
+    if (current.len == 0 and !expired) return;
+    if (leading_newline) try buf.append(allocator, '\n');
+    try buf.appendSlice(allocator, "<|im_start|>system\n");
+    try buf.appendSlice(allocator, if (expired) HERMES_RUNTIME_INSTRUCTIONS_EXPIRED else current);
+    try buf.appendSlice(allocator, "<|im_end|>\n");
+}
+
+fn appendHermesQwenLateToolBlock(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    tools_explicit: bool,
+) !void {
+    if (tools_json) |raw| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value == .array and parsed.value.array.items.len > 0) {
+            try buf.appendSlice(
+                allocator,
+                "<|im_start|>system\n" ++
+                    "# Tools\n\nYou have access to the following functions:\n\n<tools>",
+            );
+            for (parsed.value.array.items) |tool| {
+                try buf.append(allocator, '\n');
+                try responses_mod.serializeJsonValue(allocator, buf, tool);
+            }
+            try buf.appendSlice(
+                allocator,
+                "\n</tools>" ++
+                    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:" ++
+                    "\n\n<tool_call>\n<function=example_function_name>" ++
+                    "\n<parameter=example_parameter_1>\nvalue_1\n</parameter>" ++
+                    "\n<parameter=example_parameter_2>" ++
+                    "\nThis is the value for the second parameter\nthat can span\nmultiple lines" ++
+                    "\n</parameter>\n</function>\n</tool_call>" ++
+                    "\n\n<IMPORTANT>\nReminder:" ++
+                    "\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags" ++
+                    "\n- Required parameters MUST be specified" ++
+                    "\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after" ++
+                    "\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls" ++
+                    "\n</IMPORTANT>",
+            );
+            if (tool_choice_instruction) |instruction| {
+                const trimmed = std.mem.trim(u8, instruction, " \t\r\n");
+                if (trimmed.len > 0) {
+                    try buf.appendSlice(allocator, "\n\n");
+                    try buf.appendSlice(allocator, trimmed);
+                }
+            }
+            try buf.appendSlice(allocator, "<|im_end|>\n");
+            return;
+        }
+    }
+
+    if (tools_explicit) {
+        try buf.appendSlice(
+            allocator,
+            "<|im_start|>system\n# Tools\n\n" ++
+                "No tools are available for this assistant response. " ++
+                "Do not emit a tool call.<|im_end|>\n",
+        );
+    }
+}
+
+fn qwenLateDeltaSupported(messages: []const chat_mod.Message) bool {
+    if (messages.len == 0) return false;
+    for (messages) |message| {
+        if (message.images != null or message.videos != null or message.audio != null) return false;
+        if (!std.mem.eql(u8, message.role, "user") and !std.mem.eql(u8, message.role, "tool")) return false;
+    }
+    return true;
+}
+
+fn messagesHaveImages(messages: []const chat_mod.Message) bool {
+    for (messages) |message| {
+        if (message.images != null) return true;
+    }
+    return false;
+}
+
+fn messagesHaveNonImageMedia(messages: []const chat_mod.Message) bool {
+    for (messages) |message| {
+        if (message.videos != null or message.audio != null) return true;
+    }
+    return false;
+}
+
+fn latestImageMessagePrefix(messages: []const chat_mod.Message) []const chat_mod.Message {
+    var i = messages.len;
+    while (i > 0) {
+        i -= 1;
+        const message = messages[i];
+        if (std.mem.eql(u8, message.role, "user") and message.images != null) {
+            return messages[0 .. i + 1];
+        }
+    }
+    return messages;
+}
+
+fn appendHermesQwenLateMessages(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    messages: []const chat_mod.Message,
+) !void {
+    var i: usize = 0;
+    while (i < messages.len) {
+        const message = messages[i];
+        if (std.mem.eql(u8, message.role, "user")) {
+            try buf.appendSlice(allocator, "\n<|im_start|>user\n");
+            try buf.appendSlice(allocator, std.mem.trim(u8, message.content, " \t\r\n"));
+            try buf.appendSlice(allocator, "<|im_end|>\n");
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, message.role, "tool")) {
+            try buf.appendSlice(allocator, "\n<|im_start|>user");
+            while (i < messages.len and std.mem.eql(u8, messages[i].role, "tool")) : (i += 1) {
+                try buf.appendSlice(allocator, "\n<tool_response>\n");
+                try buf.appendSlice(allocator, std.mem.trim(u8, messages[i].content, " \t\r\n"));
+                try buf.appendSlice(allocator, "\n</tool_response>");
+            }
+            try buf.appendSlice(allocator, "<|im_end|>\n");
+            continue;
+        }
+        return error.UnsupportedQwenLateDelta;
+    }
+}
+
+fn buildHermesQwenLateInitialPrompt(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    base_prompt: []const u32,
+    enable_thinking: bool,
+    runtime_instructions: []const u8,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    tools_explicit: bool,
+) !?[]u32 {
+    const tail = qwenLateGenerationTail(enable_thinking);
+    const tail_ids = try tok.encode(allocator, tail);
+    defer allocator.free(tail_ids);
+    if (!tokenSliceEndsWith(base_prompt, tail_ids)) return null;
+
+    var prompt = std.ArrayList(u32).empty;
+    errdefer prompt.deinit(allocator);
+    try prompt.appendSlice(allocator, base_prompt[0 .. base_prompt.len - tail_ids.len]);
+
+    var late = std.ArrayList(u8).empty;
+    defer late.deinit(allocator);
+    try appendHermesRuntimeBlock(allocator, &late, runtime_instructions, "", false);
+    try appendHermesQwenLateToolBlock(allocator, &late, tools_json, tool_choice_instruction, tools_explicit);
+    try late.appendSlice(allocator, tail);
+    const late_ids = try tok.encode(allocator, late.items);
+    defer allocator.free(late_ids);
+    try prompt.appendSlice(allocator, late_ids);
+    return try prompt.toOwnedSlice(allocator);
+}
+
+fn buildHermesQwenLateContinuationPrompt(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    previous: *const responses_mod.StoredResponse,
+    appended_messages: []const chat_mod.Message,
+    enable_thinking: bool,
+    runtime_instructions: []const u8,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    tools_explicit: bool,
+) !?[]u32 {
+    if (!previous.qwen_late or previous.qwen_late_has_non_image_media or previous.qwen_late_tokens.len == 0 or !qwenLateDeltaSupported(appended_messages)) return null;
+
+    var delta = std.ArrayList(u8).empty;
+    defer delta.deinit(allocator);
+    try appendHermesQwenLateMessages(allocator, &delta, appended_messages);
+    try appendHermesRuntimeBlock(
+        allocator,
+        &delta,
+        runtime_instructions,
+        previous.runtime_instructions,
+        true,
+    );
+    try appendHermesQwenLateToolBlock(allocator, &delta, tools_json, tool_choice_instruction, tools_explicit);
+    try delta.appendSlice(allocator, qwenLateGenerationTail(enable_thinking));
+
+    const delta_ids = try tok.encode(allocator, delta.items);
+    defer allocator.free(delta_ids);
+    var prompt = try allocator.alloc(u32, previous.qwen_late_tokens.len + delta_ids.len);
+    @memcpy(prompt[0..previous.qwen_late_tokens.len], previous.qwen_late_tokens);
+    @memcpy(prompt[previous.qwen_late_tokens.len..], delta_ids);
+    return prompt;
+}
+
+fn buildHermesQwenLateFrontier(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    prompt_tokens: []const u32,
+    generated_tokens: []const u32,
+) ![]u32 {
+    const im_end = try tok.encode(allocator, "<|im_end|>");
+    defer allocator.free(im_end);
+    const needs_close = !tokenSliceEndsWith(generated_tokens, im_end);
+    const close_len: usize = if (needs_close) im_end.len else 0;
+    const out = try allocator.alloc(u32, prompt_tokens.len + generated_tokens.len + close_len);
+    @memcpy(out[0..prompt_tokens.len], prompt_tokens);
+    @memcpy(out[prompt_tokens.len .. prompt_tokens.len + generated_tokens.len], generated_tokens);
+    if (needs_close) @memcpy(out[prompt_tokens.len + generated_tokens.len ..], im_end);
+    return out;
+}
+
 /// Compact a conversation into a single opaque, round-trippable item.
 ///
 /// The OpenAI Responses spec treats `encrypted_content` as provider-defined.
@@ -12578,7 +12861,8 @@ fn handleResponses(
     defer if (tools_json_owned) {
         if (tools_json) |tj| allocator.free(tj);
     };
-    var has_tools = root.get("tools") != null;
+    const tools_explicit = root.get("tools") != null;
+    var has_tools = tools_explicit;
 
     const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
@@ -12612,9 +12896,11 @@ fn handleResponses(
 
     // ── previous response — fetch stored history ──
     var prev_messages: ?[]const chat_mod.Message = null;
+    var prev_stored: ?*responses_mod.StoredResponse = null;
     if (prev_id) |pid| {
         const store = getOrInitResponseStore(stream.io, allocator);
         if (store.get(pid)) |sr| {
+            prev_stored = sr;
             prev_messages = sr.history;
         } else {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
@@ -12665,8 +12951,100 @@ fn handleResponses(
     // Iteration 1 timing + Iteration 2 cache. Responses sees the same
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
+    const runtime_instructions = hermesRuntimeInstructions(root);
+    const effective_durable_instructions: []const u8 = if (instructions) |ins|
+        ins
+    else if (prev_stored) |previous|
+        previous.durable_instructions
+    else
+        "";
+    const request_qwen_late = hermesQwenLateRequested(root) and
+        isHermesQwenLateTemplate(chat_config.chat_template) and
+        lm.ds4_engine == null and lm.llama_engine == null;
+    var qwen_late_used = false;
+    var qwen_late_inherited_vision = false;
+
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var prompt_ids_raw: []u32 = undefined;
+    if (request_qwen_late) qwen_late: {
+        if (prev_stored) |previous| {
+            const instructions_compatible = instructions == null or
+                std.mem.eql(u8, instructions.?, previous.durable_instructions);
+            const effort = reasoning_cfg.effort orelse "";
+            const exact_compatible = instructions_compatible and
+                std.mem.eql(u8, previous.model, model_name) and
+                previous.enable_thinking == enable_thinking and
+                std.mem.eql(u8, previous.reasoning_effort, effort) and
+                pi.messages.items.len >= previous.history.len;
+            if (exact_compatible) {
+                const appended = pi.messages.items[previous.history.len..];
+                if (try buildHermesQwenLateContinuationPrompt(
+                    allocator,
+                    tok,
+                    previous,
+                    appended,
+                    enable_thinking,
+                    runtime_instructions,
+                    active_tools_json,
+                    active_tool_choice_instruction,
+                    tools_explicit,
+                )) |exact_prompt| {
+                    prompt_ids_raw = exact_prompt;
+                    qwen_late_used = true;
+                    qwen_late_inherited_vision = previous.qwen_late_has_vision;
+                    log.info("[hermes-qwen-late] exact continuation prev={s} base={d} prompt={d} delta_messages={d} tools={} runtime_chars={d}\n", .{
+                        previous.id,
+                        previous.qwen_late_tokens.len,
+                        exact_prompt.len,
+                        appended.len,
+                        active_has_tools,
+                        runtime_instructions.len,
+                    });
+                    break :qwen_late;
+                }
+            }
+            log.info("[hermes-qwen-late] full rebuild prev={s} reason=exact_incompatible\n", .{previous.id});
+        }
+
+        const base_prompt = try cachedFormatChat(
+            allocator,
+            stream.io,
+            lm,
+            tok,
+            chat_config,
+            pi.messages.items,
+            null,
+            null,
+            enable_thinking,
+            reasoning_cfg.effort,
+            false,
+        );
+        defer allocator.free(base_prompt);
+        if (try buildHermesQwenLateInitialPrompt(
+            allocator,
+            tok,
+            base_prompt,
+            enable_thinking,
+            runtime_instructions,
+            active_tools_json,
+            active_tool_choice_instruction,
+            tools_explicit,
+        )) |late_prompt| {
+            prompt_ids_raw = late_prompt;
+            qwen_late_used = true;
+            log.info("[hermes-qwen-late] full prompt tokens={d} tools={} runtime_chars={d}\n", .{
+                late_prompt.len,
+                active_has_tools,
+                runtime_instructions.len,
+            });
+            break :qwen_late;
+        }
+
+        log.warn("[hermes-qwen-late] template tail mismatch; using stock renderer\n", .{});
+        prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    } else {
+        prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    }
     const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
@@ -12681,11 +13059,15 @@ fn handleResponses(
         var n_vis: usize = 0;
         var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
+        const vision_messages = if (qwen_late_inherited_vision and prev_stored != null)
+            latestImageMessagePrefix(prev_stored.?.history)
+        else
+            pi.messages.items;
+        local_ve = processVisionImages(allocator, lm, ve, vision_messages, &n_vis, &n_vid, &n_aud, &vis_key) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
-        if (local_ve != null) {
+        if (local_ve != null and !qwen_late_inherited_vision) {
             const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, pi.messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
@@ -12911,6 +13293,7 @@ fn handleResponses(
             .full_prompt = prompt_ids,
             .cached_tokens = 0,
             .has_tools = active_has_tools,
+            .cache_has_tools = if (qwen_late_used) false else null,
             .enable_thinking = enable_thinking,
             .sampling = sampling,
             .eos_token_ids = eos_slice,
@@ -13186,15 +13569,12 @@ fn handleResponses(
             return;
         }
 
-        result = .{
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-        };
+        result = streamingGenerationResult(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            ts,
+            stopped,
+        );
     } else {
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
@@ -13207,7 +13587,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, if (qwen_late_used) false else null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -13371,8 +13751,36 @@ fn handleResponses(
 
     // ── store response ──
     if (should_store) {
+        var qwen_late_frontier: ?[]u32 = null;
+        defer if (qwen_late_frontier) |tokens| allocator.free(tokens);
+        if (qwen_late_used) {
+            qwen_late_frontier = try buildHermesQwenLateFrontier(
+                allocator,
+                tok,
+                prompt_ids,
+                result.token_ids,
+            );
+        }
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
+        storeResponse(
+            stream.io,
+            allocator,
+            resp_id,
+            model_name,
+            status_str,
+            envelope,
+            pi.messages.items,
+            visible_text,
+            reasoning_text,
+            stored_tool_calls,
+            qwen_late_frontier,
+            effective_durable_instructions,
+            runtime_instructions,
+            reasoning_cfg.effort orelse "",
+            enable_thinking,
+            messagesHaveImages(pi.messages.items),
+            messagesHaveNonImageMedia(pi.messages.items),
+        ) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -14386,6 +14794,13 @@ fn storeResponse(
     visible_text: []const u8,
     reasoning_text: ?[]const u8,
     tool_calls: ?[]const chat_mod.ToolCall,
+    qwen_late_tokens: ?[]const u32,
+    durable_instructions: []const u8,
+    runtime_instructions: []const u8,
+    reasoning_effort: []const u8,
+    enable_thinking: bool,
+    qwen_late_has_vision: bool,
+    qwen_late_has_non_image_media: bool,
 ) !void {
     const sr = try gpa.create(responses_mod.StoredResponse);
     errdefer gpa.destroy(sr);
@@ -14434,8 +14849,14 @@ fn storeResponse(
                 };
                 break :blk copied;
             } else null,
-            // images: not preserved across requests (would require deep-copying pixel buffers).
-            .images = null,
+            .images = if (m.images) |images| blk: {
+                const copied = try a.alloc(chat_mod.ImageData, images.len);
+                for (images, 0..) |image, j| {
+                    copied[j] = image;
+                    copied[j].pixels = try a.dupe(u8, image.pixels);
+                }
+                break :blk copied;
+            } else null,
         };
     }
     history[total_msgs - 1] = .{
@@ -14451,6 +14872,14 @@ fn storeResponse(
         .status = try a.dupe(u8, status_str),
         .body_json = try a.dupe(u8, body_json),
         .history = history,
+        .qwen_late_tokens = if (qwen_late_tokens) |tokens| try a.dupe(u32, tokens) else &.{},
+        .qwen_late = qwen_late_tokens != null,
+        .qwen_late_has_vision = qwen_late_has_vision,
+        .qwen_late_has_non_image_media = qwen_late_has_non_image_media,
+        .durable_instructions = try a.dupe(u8, durable_instructions),
+        .runtime_instructions = try a.dupe(u8, runtime_instructions),
+        .reasoning_effort = try a.dupe(u8, reasoning_effort),
+        .enable_thinking = enable_thinking,
         .arena = arena,
     };
     errdefer sr.deinit();
@@ -15166,15 +15595,144 @@ test "shouldInjectResponsesJsonInstruction skips required tool turns" {
     try testing.expect(!shouldInjectResponsesJsonInstruction(true, true, "required"));
 }
 
+test "Hermes qwen-late delta appends current runtime and tool policy only" {
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "  Continue now.  " }};
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+
+    try appendHermesQwenLateMessages(testing.allocator, &rendered, &messages);
+    try appendHermesRuntimeBlock(
+        testing.allocator,
+        &rendered,
+        "Use only the selected tool.",
+        "Old policy.",
+        true,
+    );
+    try appendHermesQwenLateToolBlock(
+        testing.allocator,
+        &rendered,
+        "[{\"type\":\"function\",\"function\":{\"name\":\"beta_tool\",\"description\":\"Beta\",\"parameters\":{\"type\":\"object\"}}}]",
+        null,
+        true,
+    );
+    try rendered.appendSlice(testing.allocator, qwenLateGenerationTail(true));
+
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "<|im_start|>user\nContinue now.<|im_end|>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Use only the selected tool.") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "beta_tool") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Old policy.") == null);
+    try testing.expect(std.mem.endsWith(u8, rendered.items, "<|im_start|>assistant\n<think>\n"));
+}
+
+test "Hermes qwen-late expires transient policy and enforces explicit no-tools" {
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+
+    try appendHermesRuntimeBlock(testing.allocator, &rendered, "", "Previous repair.", false);
+    try appendHermesQwenLateToolBlock(testing.allocator, &rendered, null, null, true);
+
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "preceding assistant response has expired") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "No tools are available") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Previous repair.") == null);
+}
+
+test "Hermes qwen-late exact delta rejects media-bearing messages" {
+    const images = [_]chat_mod.ImageData{};
+    const messages = [_]chat_mod.Message{.{
+        .role = "user",
+        .content = "inspect",
+        .images = &images,
+    }};
+    try testing.expect(!qwenLateDeltaSupported(&messages));
+}
+
+test "latest image prefix excludes later text-only user turns" {
+    const pixels = [_]u8{ 1, 2, 3, 4 };
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &pixels,
+        .width = 1,
+        .height = 1,
+    }};
+    const messages = [_]chat_mod.Message{
+        .{ .role = "user", .content = "inspect", .images = &images },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "follow up" },
+    };
+    const prefix = latestImageMessagePrefix(&messages);
+    try testing.expectEqual(@as(usize, 1), prefix.len);
+    try testing.expect(prefix[0].images != null);
+}
+
+test "streaming Responses preserve scheduler cache and timing stats" {
+    var ts = StreamingTokenStream{
+        .mode = .mtp,
+        .eos_token_ids = &.{},
+        .prompt_tokens = 12_000,
+        .cached_tokens = 10_500,
+        .completion_tokens = 300,
+        .finish_reason = "length",
+        .finish_details = "length",
+        .prefill_ns = std.time.ns_per_s,
+        .decode_ns = 2 * std.time.ns_per_s,
+    };
+    defer ts.deinit(testing.allocator);
+
+    const result = streamingGenerationResult(&.{}, &.{}, ts, false);
+    try testing.expectEqual(@as(u32, 12_000), result.prompt_tokens);
+    try testing.expectEqual(@as(u32, 10_500), result.cached_tokens);
+    try testing.expectEqual(@as(u32, 300), result.completion_tokens);
+    try testing.expectEqualStrings("length", result.finish_reason);
+    try testing.expectEqualStrings("length", result.finish_details.?);
+    try testing.expectEqual(@as(u64, std.time.ns_per_s), result.prefill_ns);
+    try testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), result.decode_ns);
+    try testing.expectApproxEqAbs(@as(f64, 1500), result.prefill_tps, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 150), result.decode_tps, 0.001);
+}
+
 test "deinitGlobalResponseStore frees stored responses" {
     deinitGlobalResponseStore();
     defer deinitGlobalResponseStore();
 
-    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
+    const pixels = [_]u8{ 7, 8, 9, 10 };
+    const images = [_]chat_mod.ImageData{.{
+        .pixels = &pixels,
+        .width = 1,
+        .height = 1,
+    }};
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &images }};
+    try storeResponse(
+        testing.io,
+        testing.allocator,
+        "resp_test",
+        "mlx-serve",
+        "completed",
+        "{}",
+        &messages,
+        "hello",
+        null,
+        null,
+        &[_]u32{ 1, 2, 3 },
+        "durable",
+        "runtime",
+        "medium",
+        true,
+        false,
+        false,
+    );
 
     if (global_response_store) |*store| {
         try testing.expectEqual(@as(usize, 1), store.map.count());
+        const stored = store.get("resp_test") orelse return error.TestUnexpectedResult;
+        try testing.expect(stored.qwen_late);
+        try testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, stored.qwen_late_tokens);
+        try testing.expectEqualStrings("durable", stored.durable_instructions);
+        try testing.expectEqualStrings("runtime", stored.runtime_instructions);
+        try testing.expectEqualStrings("medium", stored.reasoning_effort);
+        try testing.expect(stored.enable_thinking);
+        const stored_images = stored.history[0].images orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 1), stored_images.len);
+        try testing.expectEqualSlices(u8, &pixels, stored_images[0].pixels);
+        try testing.expect(stored_images[0].pixels.ptr != pixels[0..].ptr);
     } else {
         return error.TestUnexpectedResult;
     }

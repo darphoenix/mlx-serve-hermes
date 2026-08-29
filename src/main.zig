@@ -87,7 +87,6 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
-
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -250,6 +249,9 @@ fn printUsage(io: std.Io) void {
         \\                        tokenize results (default: 4). Skips re-
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
+        \\  --hermes-qwen-late  Responses-only Qwen compatibility mode: append
+        \\                        current tool schemas and transient Hermes policy
+        \\                        after the durable conversation for exact KV reuse.
         \\  --llama-cache-entries <n>
         \\                      For GGUF models served via llama.cpp, the max
         \\                        number of resident KV sessions (default: 4).
@@ -694,6 +696,8 @@ pub fn main(init: std.process.Init) !void {
             // renders+re-tokenizes, mirrors pre-Iteration-2 behavior).
             i += 1;
             server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
+        } else if (std.mem.eql(u8, args[i], "--hermes-qwen-late")) {
+            server_mod.hermes_qwen_late = true;
         } else if (std.mem.eql(u8, args[i], "--llama-cache-entries") and i + 1 < args.len) {
             // Iteration 3-5 (perf-plan Phase 5 #1): max concurrent
             // llama.cpp KV sessions per model. 1 = legacy single-session
@@ -1688,7 +1692,7 @@ fn runGenServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1817,7 +1821,7 @@ fn runHeadlessServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
