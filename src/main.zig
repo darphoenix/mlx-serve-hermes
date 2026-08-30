@@ -240,9 +240,9 @@ fn printUsage(io: std.Io) void {
         \\                        weights; see --prefill-chunk.
         \\  --ssm-checkpoint-max <n>
         \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 32). The first stride-aligned position
-        \\                        is always kept; beyond the cap the oldest are
-        \\                        dropped. 0 = unlimited, bounded only by the
+        \\                        (default: 32). The newest restore points are
+        \\                        kept; beyond the cap the oldest are dropped.
+        \\                        0 = unlimited, bounded only by the
         \\                        prefix cache's byte budget.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +

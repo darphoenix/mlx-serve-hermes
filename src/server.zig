@@ -12452,7 +12452,9 @@ fn appendHermesQwenLateToolBlock(
 }
 
 fn qwenLateDeltaSupported(messages: []const chat_mod.Message) bool {
-    if (messages.len == 0) return false;
+    // A transient repair can branch from a stored response with no durable
+    // chat delta. Its runtime instruction and current tool policy are appended
+    // separately by buildHermesQwenLateContinuationPrompt.
     for (messages) |message| {
         if (message.images != null or message.videos != null or message.audio != null) return false;
         if (!std.mem.eql(u8, message.role, "user") and !std.mem.eql(u8, message.role, "tool")) return false;
@@ -15644,6 +15646,25 @@ test "Hermes qwen-late exact delta rejects media-bearing messages" {
         .images = &images,
     }};
     try testing.expect(!qwenLateDeltaSupported(&messages));
+}
+
+test "Hermes qwen-late exact delta accepts directive-only repair" {
+    try testing.expect(qwenLateDeltaSupported(&.{}));
+
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+    try appendHermesQwenLateMessages(testing.allocator, &rendered, &.{});
+    try appendHermesRuntimeBlock(
+        testing.allocator,
+        &rendered,
+        "Process the latest tool results and continue.",
+        "",
+        true,
+    );
+    try rendered.appendSlice(testing.allocator, qwenLateGenerationTail(false));
+
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Process the latest tool results") != null);
+    try testing.expect(std.mem.endsWith(u8, rendered.items, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }
 
 test "latest image prefix excludes later text-only user turns" {

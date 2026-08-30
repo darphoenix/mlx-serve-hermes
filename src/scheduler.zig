@@ -3657,6 +3657,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             params.prefix_cache_mem_bytes,
         );
+        entry.prefix_cache.?.max_ssm_checkpoints = params.ssm_checkpoint_max;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints

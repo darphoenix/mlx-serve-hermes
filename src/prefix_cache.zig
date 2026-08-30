@@ -150,6 +150,13 @@ pub const DflashTarget = struct { cache: *KVCache, base_pos: *usize };
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
+    /// Maximum hybrid-state restore points retained after an extending
+    /// commit inherits checkpoints from the previous entry. Generation
+    /// already applies this cap to checkpoints captured within one request;
+    /// the cache must reapply it after merging across requests or a long
+    /// stateful session grows an unbounded list of full QSA-history snapshots.
+    /// 0 means unlimited.
+    max_ssm_checkpoints: u32 = 32,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
     /// Enforced on `commit`: evict LRU entries (in addition to the count
@@ -728,6 +735,17 @@ pub const HotPrefixCache = struct {
                         try merged.append(self.allocator, new[j]);
                         j += 1;
                     }
+                }
+                // `old` and `new` were each capped while their respective
+                // requests ran, but their union can exceed the per-entry cap
+                // on every extending turn. Keep the newest restore points:
+                // normal qwen-late continuations diverge near the end, and an
+                // older divergence can fall back to the SSD tier or prefill.
+                while (self.max_ssm_checkpoints > 0 and
+                    merged.items.len > self.max_ssm_checkpoints)
+                {
+                    var dropped = merged.orderedRemove(0);
+                    dropped.deinit(self.allocator);
                 }
                 self.allocator.free(old);
                 self.allocator.free(new);
@@ -1564,6 +1582,57 @@ fn pcEmptySsm() [3]SSMCacheEntry {
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
+}
+
+test "HotPrefixCache: extending hybrid commits reapply the checkpoint cap" {
+    const s = mlx.gpuStream();
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 17);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    hc.max_ssm_checkpoints = 2;
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 400);
+
+    var state128 = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&state128);
+    var state256 = pcBuildHybrid(s, 200.0, 600.0);
+    defer pcFreeHybrid(&state256);
+    const first = try testing.allocator.alloc(SSMCheckpoint, 2);
+    first[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state128, 128, s);
+    first[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state256, 256, s);
+    try hc.commitWithSsm(&cache, tokens[0..400], false, first, null, null);
+
+    try testFillCache(&cache, s, 3, 400);
+    var state512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&state512);
+    var state768 = pcBuildHybrid(s, 400.0, 800.0);
+    defer pcFreeHybrid(&state768);
+    const second = try testing.allocator.alloc(SSMCheckpoint, 2);
+    second[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state512, 512, s);
+    second[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state768, 768, s);
+    try hc.commitWithSsm(&cache, &tokens, false, second, null, null);
+
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const kept = hc.entries.items[0].ssm_checkpoints.?;
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 512), kept[0].pos);
+    try testing.expectEqual(@as(usize, 768), kept[1].pos);
+
+    // A branch matching through token 700 can now restore at 512; the old
+    // 128/256 snapshots no longer consume RAM after the extending merge.
+    var dst = try KVCache.init(testing.allocator, 3);
+    defer dst.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const restored = try hc.lookupAndRestore(&dst, &moe_off, &ssm, s, tokens[0..700], false, 0, null, null);
+    try testing.expectEqual(@as(usize, 512), restored.matched);
+    try testing.expectEqual(@as(usize, 512), dst.step);
+    try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm[0].conv_state, 0, s));
 }
 
 test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a restart" {
