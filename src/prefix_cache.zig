@@ -1635,6 +1635,49 @@ test "HotPrefixCache: extending hybrid commits reapply the checkpoint cap" {
     try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm[0].conv_state, 0, s));
 }
 
+test "HotPrefixCache: generation-final recurrent checkpoint restores generated tool-call frontier" {
+    // Reduced-scale form of the live 24.7K prompt + 17.2K generated tool call.
+    // The token entry matches through 420, while the old prefill-only state is
+    // at 247. A generation-final checkpoint must let the next 447-token prompt
+    // restore at 420 instead of clamping back to 247.
+    const s = mlx.gpuStream();
+    const entry_tokens = try testing.allocator.alloc(u32, 420);
+    defer testing.allocator.free(entry_tokens);
+    const next_prompt = try testing.allocator.alloc(u32, 447);
+    defer testing.allocator.free(next_prompt);
+    for (entry_tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+    @memcpy(next_prompt[0..420], entry_tokens);
+    for (next_prompt[420..], 420..) |*t, i| t.* = @intCast(i + 10_000);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    hc.max_ssm_checkpoints = 2;
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 420);
+
+    var prefill_state = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&prefill_state);
+    var final_state = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&final_state);
+    const checkpoints = try testing.allocator.alloc(SSMCheckpoint, 2);
+    checkpoints[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &prefill_state, 247, s);
+    checkpoints[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &final_state, 420, s);
+    try hc.commitWithSsm(&cache, entry_tokens, false, checkpoints, null, null);
+
+    var dst = try KVCache.init(testing.allocator, 3);
+    defer dst.deinit();
+    var restored_state = pcEmptySsm();
+    defer pcFreeHybrid(&restored_state);
+    var moe_off: usize = 0;
+    const restored = try hc.lookupAndRestore(&dst, &moe_off, &restored_state, s, next_prompt, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 420), restored.matched);
+    try testing.expectEqual(@as(usize, 420), dst.step);
+    try testing.expectEqual(@as(usize, 420), moe_off);
+    try testing.expectEqual(@as(f32, 300.0), pcSsmVal(restored_state[0].conv_state, 0, s));
+}
+
 test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a restart" {
     const io = std.testing.io;
     const s = mlx.gpuStream();

@@ -4356,6 +4356,65 @@ fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
     return context_len == prefix_len;
 }
 
+const KvFrontierMismatch = struct {
+    layer: usize,
+    offset: usize,
+};
+
+/// Hybrid forwards advance `moe_seq_offset`, not `KVCache.step`. Conventional
+/// full-attention layers still keep an absolute per-entry offset, while QSA
+/// stores its positional history in SSMCacheEntry and leaves every KV entry
+/// uninitialized. Validate every KV entry that actually exists; an all-empty
+/// KVCache is therefore the correct shape for a QSA-only hybrid frontier.
+fn hybridKvFrontierMismatch(cache: *const KVCache, pos: usize) ?KvFrontierMismatch {
+    for (cache.entries, 0..) |entry, layer| {
+        if (entry.initialized and entry.offset != pos) return .{
+            .layer = layer,
+            .offset = entry.offset,
+        };
+    }
+    return null;
+}
+
+/// Append the materialized recurrent state at a completed generation's exact
+/// token frontier. `existing` is the owned prefill-checkpoint slice drained
+/// from the Generator. On success this function consumes/frees that slice and
+/// returns a replacement; on error ownership remains with the caller.
+fn appendGenerationFinalSsmCheckpoint(
+    allocator: std.mem.Allocator,
+    existing: []transformer_mod.SSMCheckpoint,
+    ssm_entries: []const SSMCacheEntry,
+    pos: usize,
+    max_checkpoints: u32,
+    s: mlx.mlx_stream,
+) ![]transformer_mod.SSMCheckpoint {
+    var final_cp = try transformer_mod.captureSsmCheckpoint(allocator, ssm_entries, pos, s);
+    errdefer final_cp.deinit(allocator);
+
+    // A same-position checkpoint should not normally occur (prefill ends
+    // before generated tokens), but replacing it keeps the helper correct for
+    // unusual zero-width/template paths and avoids duplicate restore points.
+    const replace_last = existing.len > 0 and existing[existing.len - 1].pos == pos;
+    const old_end = existing.len - @intFromBool(replace_last);
+    const uncapped_total = old_end + 1;
+    const kept_total = if (max_checkpoints > 0)
+        @min(uncapped_total, @as(usize, max_checkpoints))
+    else
+        uncapped_total;
+    const kept_old = kept_total - 1;
+    const old_start = old_end - kept_old;
+
+    const out = try allocator.alloc(transformer_mod.SSMCheckpoint, kept_total);
+    // Allocation succeeded, so ownership can move. Discard checkpoints outside
+    // the newest bounded window before freeing the old container.
+    for (existing[0..old_start]) |*cp| cp.deinit(allocator);
+    if (replace_last) existing[existing.len - 1].deinit(allocator);
+    @memcpy(out[0..kept_old], existing[old_start..old_end]);
+    out[kept_old] = final_cp;
+    allocator.free(existing);
+    return out;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -4399,7 +4458,40 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    const checkpoint_allocator = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
+    if (slot.ssm_entries) |entries| {
+        const kv_mismatch = hybridKvFrontierMismatch(&slot.cache, total_len);
+        if (n_gen > 0 and
+            !slot.cancelled.load(.acquire) and
+            slot.moe_seq_offset == total_len and
+            kv_mismatch == null)
+        {
+            const prefill_cp_count = ssm_cps_slice.len;
+            ssm_cps_slice = appendGenerationFinalSsmCheckpoint(
+                checkpoint_allocator,
+                ssm_cps_slice,
+                entries,
+                total_len,
+                hc.max_ssm_checkpoints,
+                slot.model.transformer.?.s,
+            ) catch |err| blk: {
+                log.warn("[hot-cache] generation-final recurrent checkpoint failed at {d}: {s}\n", .{ total_len, @errorName(err) });
+                break :blk ssm_cps_slice;
+            };
+            if (ssm_cps_slice.len > prefill_cp_count or
+                (ssm_cps_slice.len > 0 and ssm_cps_slice[ssm_cps_slice.len - 1].pos == total_len))
+            {
+                log.info("[hot-cache] generation-final recurrent checkpoint @{d} ({d} prefill -> {d} retained)\n", .{ total_len, prefill_cp_count, ssm_cps_slice.len });
+            }
+        } else if (n_gen > 0 and !slot.cancelled.load(.acquire)) {
+            if (kv_mismatch) |mismatch| {
+                log.warn("[hot-cache] generation-final recurrent checkpoint skipped: committed={d} recurrent={d} kv_layer={d} kv_offset={d}\n", .{ total_len, slot.moe_seq_offset, mismatch.layer, mismatch.offset });
+            } else {
+                log.warn("[hot-cache] generation-final recurrent checkpoint skipped: committed={d} recurrent={d}\n", .{ total_len, slot.moe_seq_offset });
+            }
+        }
+    }
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
@@ -4437,7 +4529,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
-        const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
+        const a = checkpoint_allocator;
         if (ssm_cps_opt) |cps| {
             for (cps) |*cp| cp.deinit(a);
             a.free(cps);
@@ -5731,6 +5823,73 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "successful hybrid generation commits its final recurrent frontier" {
+    // Regression for a 24.7K prompt + 17.2K generated tool call: the next
+    // qwen-late prompt shared 42K tokens, but restore stopped at 24.7K because
+    // only prefill checkpoints were committed. The final live SSM/QSA state
+    // must ride the same prompt+generated token commit, and cancelled slots
+    // must not publish it.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "appendGenerationFinalSsmCheckpoint") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.moe_seq_offset == total_len") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "hybridKvFrontierMismatch") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "!slot.cancelled.load(.acquire)") != null);
+}
+
+test "hybrid KV frontier accepts QSA-only state and validates initialized attention layers" {
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+
+    // QSA stores its key history in SSMCacheEntry, so no conventional KV
+    // entry is initialized even though the recurrent cursor is far advanced.
+    try testing.expect(hybridKvFrontierMismatch(&cache, 42_000) == null);
+
+    cache.entries[1].initialized = true;
+    cache.entries[1].offset = 42_000;
+    try testing.expect(hybridKvFrontierMismatch(&cache, 42_000) == null);
+
+    cache.entries[1].offset = 24_728;
+    const mismatch = hybridKvFrontierMismatch(&cache, 42_000).?;
+    try testing.expectEqual(@as(usize, 1), mismatch.layer);
+    try testing.expectEqual(@as(usize, 24_728), mismatch.offset);
+}
+
+test "generation-final recurrent checkpoint keeps the newest bounded frontier" {
+    const s = mlx.gpuStream();
+    var state = [_]SSMCacheEntry{.{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    }};
+    defer {
+        _ = mlx.mlx_array_free(state[0].conv_state);
+        _ = mlx.mlx_array_free(state[0].ssm_state);
+    }
+
+    const old = try testing.allocator.alloc(transformer_mod.SSMCheckpoint, 2);
+    old[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state, 24_728, s);
+    old[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &state, 32_768, s);
+    const kept = try appendGenerationFinalSsmCheckpoint(
+        testing.allocator,
+        old,
+        &state,
+        42_000,
+        2,
+        s,
+    );
+    defer {
+        for (kept) |*cp| cp.deinit(testing.allocator);
+        testing.allocator.free(kept);
+    }
+
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 32_768), kept[0].pos);
+    try testing.expectEqual(@as(usize, 42_000), kept[1].pos);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
