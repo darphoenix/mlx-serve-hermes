@@ -13647,6 +13647,22 @@ fn handleResponses(
         for (emitted_tool_calls.items) |tc| allocator.free(tc.id);
         emitted_tool_calls.deinit(allocator);
     }
+    var undeclared_tool_names = std.ArrayList([]const u8).empty;
+    defer undeclared_tool_names.deinit(allocator);
+    if (tool_calls) |tcs| {
+        for (tcs) |tc| {
+            if (responsesToolExists(root.get("tools"), tc.name)) continue;
+            var duplicate = false;
+            for (undeclared_tool_names.items) |existing| {
+                if (std.mem.eql(u8, existing, tc.name)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try undeclared_tool_names.append(allocator, tc.name);
+        }
+    }
+    const has_tool_policy_conflict = undeclared_tool_names.items.len > 0;
 
     if (reasoning_text) |rt| if (rt.len > 0) {
         if (emitted > 0) try out_buf.append(allocator, ',');
@@ -13667,12 +13683,8 @@ fn handleResponses(
         output_index += 1;
     };
 
-    if (tool_calls) |tcs| if (tcs.len > 0) {
+    if (!has_tool_policy_conflict) if (tool_calls) |tcs| if (tcs.len > 0) {
         for (tcs) |tc| {
-            if (!responsesToolExists(root.get("tools"), tc.name)) {
-                log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
-                continue;
-            }
             if (!isJsonObjectString(allocator, tc.arguments)) {
                 log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
                 continue;
@@ -13696,19 +13708,30 @@ fn handleResponses(
         }
     };
 
+    if (has_tool_policy_conflict) {
+        log.warn(
+            "[responses] rejecting action with {d} undeclared tool call name(s); returning structured tool-policy conflict\n",
+            .{undeclared_tool_names.items.len},
+        );
+    }
+
     const has_tool_calls = emitted_tool_calls.items.len > 0;
     if (!has_tool_calls) {
+        const output_text = if (has_tool_policy_conflict)
+            "[HERMES_INTERNAL_TOOL_POLICY_CONFLICT]"
+        else
+            visible_text;
         if (emitted > 0) try out_buf.append(allocator, ',');
-        if (is_stream and streamed_message_started) {
+        if (is_stream and streamed_message_started and !has_tool_policy_conflict) {
             // Live deltas already streamed; emit just the closing events.
-            try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, output_text);
+            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, output_text);
         } else {
             const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
-            try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
-            if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, visible_text);
+            try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, output_text);
+            if (is_stream and !has_tool_policy_conflict) {
+                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, output_text);
             }
         }
         emitted += 1;
@@ -13728,6 +13751,18 @@ fn handleResponses(
         defer allocator.free(rids);
         break :blk @intCast(rids.len);
     };
+    var conflict_metadata_json: ?[]const u8 = null;
+    defer if (conflict_metadata_json) |metadata_json| allocator.free(metadata_json);
+    var final_response_echo = response_echo;
+    if (has_tool_policy_conflict) {
+        conflict_metadata_json = try renderResponsesToolPolicyConflictMetadata(
+            allocator,
+            root.get("metadata"),
+            undeclared_tool_names.items,
+        );
+        final_response_echo.metadata_json = conflict_metadata_json.?;
+    }
+
     const envelope = try buildResponsesEnvelope(
         stream.io,
         allocator,
@@ -13743,7 +13778,7 @@ fn handleResponses(
         prev_id,
         is_incomplete,
         is_completed_status,
-        response_echo,
+        final_response_echo,
         result.prefill_ns,
         result.decode_ns,
         tokenize_ns,
@@ -13772,7 +13807,7 @@ fn handleResponses(
             status_str,
             envelope,
             pi.messages.items,
-            visible_text,
+            if (has_tool_policy_conflict) "" else visible_text,
             reasoning_text,
             stored_tool_calls,
             qwen_late_frontier,
@@ -14322,6 +14357,48 @@ fn renderResponsesMetadataEcho(allocator: std.mem.Allocator, root: std.json.Obje
         return try buf.toOwnedSlice(allocator);
     };
     return try allocator.dupe(u8, "{}");
+}
+
+fn renderResponsesToolPolicyConflictMetadata(
+    allocator: std.mem.Allocator,
+    metadata_val: ?std.json.Value,
+    tool_names: []const []const u8,
+) ![]const u8 {
+    var conflict = std.ArrayList(u8).empty;
+    defer conflict.deinit(allocator);
+    try conflict.appendSlice(allocator, "{\"type\":\"undeclared_tool_call\",\"tool_names\":[");
+    for (tool_names, 0..) |name, i| {
+        if (i > 0) try conflict.append(allocator, ',');
+        const escaped = try jsonEscape(allocator, name);
+        defer allocator.free(escaped);
+        try conflict.appendSlice(allocator, escaped);
+    }
+    try conflict.appendSlice(allocator, "]}");
+    const escaped_conflict = try jsonEscape(allocator, conflict.items);
+    defer allocator.free(escaped_conflict);
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '{');
+    var emitted: usize = 0;
+    if (metadata_val) |mv| if (mv == .object) {
+        var iter = mv.object.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "hermes_tool_policy_conflict")) continue;
+            if (emitted > 0) try buf.append(allocator, ',');
+            emitted += 1;
+            const escaped_key = try jsonEscape(allocator, entry.key_ptr.*);
+            defer allocator.free(escaped_key);
+            try buf.appendSlice(allocator, escaped_key);
+            try buf.append(allocator, ':');
+            try responses_mod.serializeJsonValue(allocator, &buf, entry.value_ptr.*);
+        }
+    };
+    if (emitted > 0) try buf.append(allocator, ',');
+    try buf.appendSlice(allocator, "\"hermes_tool_policy_conflict\":");
+    try buf.appendSlice(allocator, escaped_conflict);
+    try buf.append(allocator, '}');
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Echoed-back fields that round out the OpenAI Responses envelope.
@@ -18141,6 +18218,36 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
     }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
     for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+}
+
+test "Responses tool-policy conflict metadata is structured and preserves caller metadata" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"trace\":\"abc\",\"hermes_tool_policy_conflict\":\"stale\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    const names = [_][]const u8{ "write_file", "terminal" };
+    const rendered = try renderResponsesToolPolicyConflictMetadata(
+        allocator,
+        parsed.value,
+        &names,
+    );
+    defer allocator.free(rendered);
+
+    const metadata = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer metadata.deinit();
+    try std.testing.expectEqualStrings("abc", metadata.value.object.get("trace").?.string);
+    const conflict_string = metadata.value.object.get("hermes_tool_policy_conflict").?.string;
+    const conflict = try std.json.parseFromSlice(std.json.Value, allocator, conflict_string, .{});
+    defer conflict.deinit();
+    try std.testing.expectEqualStrings("undeclared_tool_call", conflict.value.object.get("type").?.string);
+    const parsed_names = conflict.value.object.get("tool_names").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parsed_names.len);
+    try std.testing.expectEqualStrings("write_file", parsed_names[0].string);
+    try std.testing.expectEqualStrings("terminal", parsed_names[1].string);
 }
 
 test "the 413 names both counts it compared" {
