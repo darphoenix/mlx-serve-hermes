@@ -649,6 +649,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/music-generations",
     "/v1/audio/speech",
     "/v1/chat/completions",
+    "/v1/cache/compact",
     "/v1/completions",
     "/v1/embeddings",
     "/v1/images/edits",
@@ -1390,6 +1391,7 @@ pub fn serve(
     log.info("  GET  /props\n", .{});
     log.info("  GET  /v1/models\n", .{});
     log.info("  POST /v1/chat/completions\n", .{});
+    log.info("  POST /v1/cache/compact\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
@@ -1741,6 +1743,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponsesCompact(allocator, stream, body);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/cache/compact")) {
+        try handleCacheCompact(allocator, stream);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/load-model")) {
@@ -8619,6 +8625,7 @@ test "routeExists answers endpoint existence without consulting the model" {
     // `/v1/responses/{id}` is served by prefix, not by an exact literal.
     try std.testing.expect(routeExists("/v1/responses/resp_abc123"));
     try std.testing.expect(routeExists("/v1/responses/compact"));
+    try std.testing.expect(routeExists("/v1/cache/compact"));
 
     try std.testing.expect(!routeExists("/v1/__llmprobe_no_such_endpoint__"));
     try std.testing.expect(!routeExists("/v1/audio/transcriptions")); // real OpenAI route we don't serve
@@ -12692,6 +12699,40 @@ fn handleResponsesCompact(
     defer allocator.free(out);
 
     log.info("POST /v1/responses/compact ({d} msgs -> {d}b blob)\n", .{ pi.messages.items.len, blob.len });
+    try sendResponse(stream, "200 OK", "application/json", out);
+}
+
+/// Pressure-reclaim endpoint for a colocated sidecar. The scheduler performs
+/// the release on its inference thread because prefix snapshots own MLX arrays.
+/// Only old live branches are removed; disk checkpoints remain intact.
+fn handleCacheCompact(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_unavailable", "Scheduler is not available", 503);
+        return;
+    };
+    const result = scheduler.compactPrefixCacheToNewest() catch |err| {
+        log.warn("POST /v1/cache/compact -> 503 ({s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "cache_compaction_failed", "Prefix cache compaction failed", 503);
+        return;
+    };
+    const released_bytes = result.bytes_before -| result.bytes_after;
+    const out = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"ok\",\"cache_available\":{},\"entries_before\":{d},\"entries_after\":{d},\"bytes_before\":{d},\"bytes_after\":{d},\"released_bytes\":{d}}}",
+        .{
+            result.cache_available,
+            result.entries_before,
+            result.entries_after,
+            result.bytes_before,
+            result.bytes_after,
+            released_bytes,
+        },
+    );
+    defer allocator.free(out);
+    log.info(
+        "POST /v1/cache/compact -> 200 (entries {d}->{d}, bytes {d}->{d})\n",
+        .{ result.entries_before, result.entries_after, result.bytes_before, result.bytes_after },
+    );
     try sendResponse(stream, "200 OK", "application/json", out);
 }
 

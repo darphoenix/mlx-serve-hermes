@@ -147,6 +147,13 @@ pub const DflashCommit = struct { cache: *const KVCache, base_pos: usize };
 /// written on every path so the caller can build `DflashCtx` from it.
 pub const DflashTarget = struct { cache: *KVCache, base_pos: *usize };
 
+pub const RetainNewestResult = struct {
+    entries_before: usize,
+    entries_after: usize,
+    bytes_before: u64,
+    bytes_after: u64,
+};
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
@@ -910,6 +917,23 @@ pub const HotPrefixCache = struct {
         }
     }
 
+    /// Collapse live RAM state to the newest branch without touching the SSD
+    /// tier. This is the pressure-reclaim path used by a colocated sidecar:
+    /// stateful continuation keeps the current branch hot while older branches
+    /// remain available through the disk cache.
+    pub fn retainNewest(self: *HotPrefixCache, reason: []const u8) RetainNewestResult {
+        const before_entries = self.entries.items.len;
+        const before_bytes = self.current_kv_bytes;
+        while (self.entries.items.len > 1) self.evictOneLru(reason);
+        if (before_entries != self.entries.items.len) self.logResident();
+        return .{
+            .entries_before = before_entries,
+            .entries_after = self.entries.items.len,
+            .bytes_before = before_bytes,
+            .bytes_after = self.current_kv_bytes,
+        };
+    }
+
     fn logResident(self: *const HotPrefixCache) void {
         const mb = @as(f64, @floatFromInt(self.current_kv_bytes)) / (1024.0 * 1024.0);
         if (self.max_kv_bytes == 0) {
@@ -1000,6 +1024,34 @@ test "HotPrefixCache: init zero capacity clamps to 1" {
     defer cache.deinit();
     try testing.expectEqual(@as(u32, 1), cache.max_entries);
     try testing.expectEqual(@as(usize, 0), cache.entryCount());
+}
+
+test "HotPrefixCache: pressure compaction retains only newest live branch" {
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+
+    for ([_]struct { token: u32, last_used: u64, bytes: u64 }{
+        .{ .token = 1, .last_used = 2, .bytes = 100 },
+        .{ .token = 2, .last_used = 9, .bytes = 300 },
+        .{ .token = 3, .last_used = 5, .bytes = 200 },
+    }) |item| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{item.token}),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = item.last_used,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = item.bytes,
+        });
+        cache.current_kv_bytes += item.bytes;
+    }
+
+    const result = cache.retainNewest("test pressure");
+    try testing.expectEqual(@as(usize, 3), result.entries_before);
+    try testing.expectEqual(@as(usize, 1), result.entries_after);
+    try testing.expectEqual(@as(u64, 600), result.bytes_before);
+    try testing.expectEqual(@as(u64, 300), result.bytes_after);
+    try testing.expectEqual(@as(u32, 2), cache.entries.items[0].tokens[0]);
 }
 
 test "HotPrefixCache: findBestMatch returns longest shared prefix" {

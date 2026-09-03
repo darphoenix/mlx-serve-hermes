@@ -1078,6 +1078,24 @@ pub const UnloadRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+pub const PrefixCacheCompactResult = struct {
+    cache_available: bool = false,
+    entries_before: usize = 0,
+    entries_after: usize = 0,
+    bytes_before: u64 = 0,
+    bytes_after: u64 = 0,
+};
+
+/// Cross-process pressure-reclaim request. Prefix-cache arrays belong to the
+/// inference stream, so an HTTP connection thread posts this work instead of
+/// releasing MLX references directly.
+pub const PrefixCacheCompactRequest = struct {
+    result: PrefixCacheCompactResult = .{},
+    done: bool = false,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
 /// state — Transformer + weights + vision encoder + drafter all live here,
@@ -1213,6 +1231,9 @@ pub const Scheduler = struct {
     /// inference thread drains this queue between ticks where it owns the
     /// stream binding, so all mlx ops stay on one thread.
     cleanup_queue: std.ArrayList(*Slot),
+    /// Requests to retain only the newest live prefix-cache branch. The SSD
+    /// tier is intentionally untouched, so old branches remain resumable.
+    prefix_cache_compact_queue: std.ArrayList(*PrefixCacheCompactRequest),
     /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
     /// Read once per REQUEST in `finishSlot` — never on the per-token path.
     metrics: ?*metrics_mod.Metrics,
@@ -1341,6 +1362,7 @@ pub const Scheduler = struct {
             .gen_queue = std.ArrayList(*GenRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
+            .prefix_cache_compact_queue = std.ArrayList(*PrefixCacheCompactRequest).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
@@ -1447,6 +1469,13 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.unload_queue.deinit(self.allocator);
+        for (self.prefix_cache_compact_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.prefix_cache_compact_queue.deinit(self.allocator);
 
         // Plan 05: mlx-allocating state lives on the `LoadedModel` owned by
         // the registry. We can't free the entries here (registry teardown
@@ -1920,6 +1949,24 @@ pub const Scheduler = struct {
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
         req.done_mu.unlock(self.io);
+    }
+
+    /// Retain only the most recently used live prefix branch and leave all
+    /// disk snapshots intact. Blocks until the inference thread has released
+    /// the old MLX references and flushed allocator cache memory.
+    pub fn compactPrefixCacheToNewest(self: *Scheduler) !PrefixCacheCompactResult {
+        var req = PrefixCacheCompactRequest{};
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.prefix_cache_compact_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+        return req.result;
     }
 
     /// Synchronously compute embeddings for `req.token_seqs` using the
@@ -3797,6 +3844,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // synchronously, blocking decode for its duration.
         var gen_req: ?*GenRequest = null;
         var unload_req: ?*UnloadRequest = null;
+        var prefix_cache_compact_req: ?*PrefixCacheCompactRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
@@ -3820,6 +3868,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             }
             if (sch.gen_queue.items.len > 0) {
                 gen_req = sch.gen_queue.orderedRemove(0);
+            }
+            if (sch.prefix_cache_compact_queue.items.len > 0) {
+                prefix_cache_compact_req = sch.prefix_cache_compact_queue.orderedRemove(0);
             }
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
@@ -3849,6 +3900,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (gen_req) |req| runGenRequest(sch, req);
+        if (prefix_cache_compact_req) |req| runPrefixCacheCompactRequest(sch, req);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
         //    run prefills outside the lock.
@@ -3857,7 +3909,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and sch.prefix_cache_compact_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
@@ -4346,6 +4398,26 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     // configuration the policy exists to avoid.
     logWiredPolicy(mlx.applyWiredPolicy());
 
+    req.done_mu.lockUncancelable(sch.io);
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+    req.done_mu.unlock(sch.io);
+}
+
+fn runPrefixCacheCompactRequest(sch: *Scheduler, req: *PrefixCacheCompactRequest) void {
+    if (sch.hot_prefix_cache) |cache| {
+        const retained = cache.retainNewest("sidecar memory pressure");
+        req.result = .{
+            .cache_available = true,
+            .entries_before = retained.entries_before,
+            .entries_after = retained.entries_after,
+            .bytes_before = retained.bytes_before,
+            .bytes_after = retained.bytes_after,
+        };
+        if (retained.bytes_after < retained.bytes_before) {
+            _ = mlx.mlx_clear_cache();
+        }
+    }
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
     req.done_cond.broadcast(sch.io);
