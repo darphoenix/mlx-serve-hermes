@@ -60,6 +60,11 @@ pub const LookupResult = struct {
     /// without this every reused prefix drafts against an empty history
     /// (measured on Qwen3.6-27B echo: ~70 → ~38 tok/s on warm repeats).
     mtp_base: ?usize = null,
+    /// Whether this request acquired or renewed the exclusive foreground
+    /// lease at lookup admission. This is latched for the lifetime of the
+    /// scheduler slot: a request denied here must not acquire the lease later
+    /// at commit merely because the original owner finished meanwhile.
+    lease_owned: bool = false,
 };
 
 const Entry = struct {
@@ -78,6 +83,10 @@ const Entry = struct {
     snapshot: KVCacheSnapshot,
     /// Monotonic counter for LRU. Higher = more recent.
     last_used: u64,
+    /// Foreground-turn lease that owns this branch. Only the newest entry for
+    /// the cache's active lease is protected from count/byte/pressure
+    /// eviction; zero means ordinary LRU state.
+    cache_lease_id: u64 = 0,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -174,6 +183,11 @@ pub const HotPrefixCache = struct {
     current_kv_bytes: u64,
     allocator: std.mem.Allocator,
     counter: u64 = 0,
+    /// Exclusive foreground-turn lease. A second turn cannot steal it while
+    /// the first is live; Hermes releases it from its single turn-finalizer
+    /// chokepoint. The deadline is only a crash fallback.
+    active_lease_id: u64 = 0,
+    active_lease_deadline_ms: i64 = 0,
     /// Set to true once we've called `xfm.resetCache()` at least once after
     /// init. The first commit on a fresh cache must seed an empty entry so
     /// future restores have something to land on.
@@ -355,6 +369,53 @@ pub const HotPrefixCache = struct {
         return self.counter;
     }
 
+    fn expireLease(self: *HotPrefixCache, now_ms: i64) void {
+        if (self.active_lease_id != 0 and now_ms >= self.active_lease_deadline_ms) {
+            log.warn("  [hot-cache] foreground lease expired id={x}\n", .{self.active_lease_id});
+            self.active_lease_id = 0;
+            self.active_lease_deadline_ms = 0;
+        }
+    }
+
+    /// First live foreground turn wins. Repeated requests from that turn renew
+    /// the lease; nested Hermes runs carry different turn ids and remain
+    /// ordinary LRU entries until the owner explicitly releases.
+    fn claimLease(self: *HotPrefixCache, lease_id: u64, deadline_ms: i64, now_ms: i64) bool {
+        if (lease_id == 0) return false;
+        self.expireLease(now_ms);
+        if (self.active_lease_id != 0 and self.active_lease_id != lease_id) {
+            log.debug("  [hot-cache] foreground lease retained owner={x}; rejected={x}\n", .{ self.active_lease_id, lease_id });
+            return false;
+        }
+        const acquired = self.active_lease_id == 0;
+        self.active_lease_id = lease_id;
+        self.active_lease_deadline_ms = deadline_ms;
+        if (acquired) log.info("  [hot-cache] foreground lease acquired id={x}\n", .{lease_id});
+        return true;
+    }
+
+    pub fn releaseLease(self: *HotPrefixCache, lease_id: u64) bool {
+        if (lease_id == 0 or self.active_lease_id != lease_id) return false;
+        self.active_lease_id = 0;
+        self.active_lease_deadline_ms = 0;
+        log.info("  [hot-cache] foreground lease released id={x}\n", .{lease_id});
+        return true;
+    }
+
+    fn protectedIndex(self: *HotPrefixCache, now_ms: i64) ?usize {
+        self.expireLease(now_ms);
+        if (self.active_lease_id == 0) return null;
+        var best: ?usize = null;
+        var newest: u64 = 0;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.cache_lease_id == self.active_lease_id and (best == null or e.last_used > newest)) {
+                best = i;
+                newest = e.last_used;
+            }
+        }
+        return best;
+    }
+
     /// Wave 1.B: total KV bytes held by a snapshot — sum of `size * itemsize`
     /// across every initialized entry's storage arrays. mlx-c arrays carry
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
@@ -425,6 +486,38 @@ pub const HotPrefixCache = struct {
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
     ) !LookupResult {
+        return self.lookupAndRestoreWithLease(
+            target_cache,
+            target_moe_seq_offset,
+            target_ssm_entries,
+            s,
+            prompt_ids,
+            has_tools,
+            vision_key,
+            dflash_target,
+            mtp_target,
+            0,
+            0,
+            0,
+        );
+    }
+
+    pub fn lookupAndRestoreWithLease(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        cache_lease_id: u64,
+        cache_lease_deadline_ms: i64,
+        now_ms: i64,
+    ) !LookupResult {
+        const owns_lease = self.claimLease(cache_lease_id, cache_lease_deadline_ms, now_ms);
         const match = self.findBestMatch(prompt_ids, has_tools, vision_key, target_cache.config);
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
@@ -466,6 +559,7 @@ pub const HotPrefixCache = struct {
                     .full_match = false,
                     .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = diskRestoreSpec(d, dm.idx, mtp_target, restored, s, .mtp),
+                    .lease_owned = owns_lease,
                 };
             }
 
@@ -496,6 +590,7 @@ pub const HotPrefixCache = struct {
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
                 .mtp_base = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp),
+                .lease_owned = owns_lease,
             };
         }
 
@@ -503,11 +598,12 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
-            return .{ .matched = 0, .full_match = false };
+            return .{ .matched = 0, .full_match = false, .lease_owned = owns_lease };
         }
         const m = match.?;
         const e = &self.entries.items[m.idx];
         e.last_used = self.bumpCounter();
+        if (owns_lease) e.cache_lease_id = cache_lease_id;
 
         try target_cache.restore(&e.snapshot);
 
@@ -542,7 +638,7 @@ pub const HotPrefixCache = struct {
         if (effective_matched == 0) {
             try target_cache.truncate(0, s);
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
-            return .{ .matched = 0, .full_match = false };
+            return .{ .matched = 0, .full_match = false, .lease_owned = owns_lease };
         }
 
         const full_match = effective_matched == prompt_ids.len;
@@ -571,6 +667,7 @@ pub const HotPrefixCache = struct {
                 .full_match = true,
                 .dflash_base = restoreDflash(e, dflash_target, effective_matched - 1, s),
                 .mtp_base = restoreMtp(e, mtp_target, effective_matched - 1, s),
+                .lease_owned = owns_lease,
             };
         }
 
@@ -580,6 +677,7 @@ pub const HotPrefixCache = struct {
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
             .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
+            .lease_owned = owns_lease,
         };
     }
 
@@ -625,10 +723,43 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !void {
+        return self.commitWithStateLease(
+            source_cache,
+            tokens,
+            has_tools,
+            vision_key,
+            ssm_cps,
+            dflash,
+            mtp,
+            0,
+            false,
+            0,
+        );
+    }
+
+    pub fn commitWithStateLease(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+        cache_lease_id: u64,
+        cache_lease_owned: bool,
+        now_ms: i64,
+    ) !void {
         const quant_config = source_cache.config;
+        self.expireLease(now_ms);
+        const owns_lease = cache_lease_owned and cache_lease_id != 0 and self.active_lease_id == cache_lease_id;
+        const protected_idx = self.protectedIndex(now_ms);
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
+            // A nested turn must not overwrite the foreground checkpoint even
+            // when its token stream happens to extend the same prefix.
+            if (!owns_lease and protected_idx != null and protected_idx.? == i) continue;
             if (e.has_tools != has_tools) continue;
             if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
@@ -791,6 +922,7 @@ pub const HotPrefixCache = struct {
             e.mtp = new_mtp;
             e.mtp_bytes = new_mtp_bytes;
             e.last_used = self.bumpCounter();
+            e.cache_lease_id = if (owns_lease) cache_lease_id else 0;
             self.current_kv_bytes += e.kv_bytes;
             if (self.disk != null) self.disk_dirty = true;
             self.logResident();
@@ -798,11 +930,19 @@ pub const HotPrefixCache = struct {
         }
 
         while (self.entries.items.len >= self.max_entries) {
-            self.evictOneLru("count cap");
+            if (!self.evictOneLru("count cap", now_ms)) {
+                self.freePendingCommit(tokens_owned, new_snap, ssm_cps, new_dflash, new_mtp);
+                log.info("  [hot-cache] skipped commit: only foreground-leased branch is resident\n", .{});
+                return;
+            }
         }
         if (self.max_kv_bytes > 0) {
             while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                self.evictOneLru("byte budget");
+                if (!self.evictOneLru("byte budget", now_ms)) {
+                    self.freePendingCommit(tokens_owned, new_snap, ssm_cps, new_dflash, new_mtp);
+                    log.info("  [hot-cache] skipped commit: byte budget is occupied by foreground lease\n", .{});
+                    return;
+                }
             }
         }
 
@@ -812,6 +952,7 @@ pub const HotPrefixCache = struct {
             .vision_key = vision_key,
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
+            .cache_lease_id = if (owns_lease) cache_lease_id else 0,
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
             .ssm_checkpoints = ssm_cps,
@@ -890,16 +1031,44 @@ pub const HotPrefixCache = struct {
         if (!complete) self.disk_dirty = true;
     }
 
-    fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
-        var lru_idx: usize = 0;
+    fn freePendingCommit(
+        self: *HotPrefixCache,
+        tokens: []u32,
+        snapshot: KVCacheSnapshot,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashSnap,
+        mtp: ?DflashSnap,
+    ) void {
+        self.allocator.free(tokens);
+        var snap = snapshot;
+        snap.deinit();
+        if (dflash) |value| {
+            var owned = value;
+            owned.deinit();
+        }
+        if (mtp) |value| {
+            var owned = value;
+            owned.deinit();
+        }
+        if (ssm_cps) |cps| {
+            for (cps) |*cp| cp.deinit(self.allocator);
+            self.allocator.free(cps);
+        }
+    }
+
+    fn evictOneLru(self: *HotPrefixCache, reason: []const u8, now_ms: i64) bool {
+        const protected_idx = self.protectedIndex(now_ms);
+        var lru_idx: ?usize = null;
         var lru_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
+            if (protected_idx != null and protected_idx.? == i) continue;
             if (e.last_used < lru_used) {
                 lru_used = e.last_used;
                 lru_idx = i;
             }
         }
-        var evicted = self.entries.swapRemove(lru_idx);
+        const idx = lru_idx orelse return false;
+        var evicted = self.entries.swapRemove(idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
         const had_ssm = evicted.ssm_checkpoints != null;
@@ -915,6 +1084,7 @@ pub const HotPrefixCache = struct {
                 reason, tokens_len, kv_mb,
             });
         }
+        return true;
     }
 
     /// Collapse live RAM state to the newest branch without touching the SSD
@@ -922,10 +1092,38 @@ pub const HotPrefixCache = struct {
     /// stateful continuation keeps the current branch hot while older branches
     /// remain available through the disk cache.
     pub fn retainNewest(self: *HotPrefixCache, reason: []const u8) RetainNewestResult {
+        return self.retainProtectedOrNewest(reason, std.math.maxInt(i64));
+    }
+
+    /// Pressure compaction keeps the foreground owner's newest checkpoint,
+    /// even when a nested/background request committed more recently.
+    pub fn retainProtectedOrNewest(self: *HotPrefixCache, reason: []const u8, now_ms: i64) RetainNewestResult {
         const before_entries = self.entries.items.len;
         const before_bytes = self.current_kv_bytes;
-        while (self.entries.items.len > 1) self.evictOneLru(reason);
-        if (before_entries != self.entries.items.len) self.logResident();
+        const keep_idx = self.protectedIndex(now_ms) orelse blk: {
+            if (self.entries.items.len == 0) break :blk 0;
+            var newest_idx: usize = 0;
+            for (self.entries.items, 0..) |*e, i| {
+                if (e.last_used > self.entries.items[newest_idx].last_used) newest_idx = i;
+            }
+            break :blk newest_idx;
+        };
+        if (self.entries.items.len > 0) {
+            var i = self.entries.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (i == keep_idx) continue;
+                var evicted = self.entries.orderedRemove(i);
+                self.current_kv_bytes -|= evicted.kv_bytes;
+                freeEntryOwnedState(self.allocator, &evicted);
+            }
+        }
+        if (before_entries != self.entries.items.len) {
+            log.info("  [hot-cache] compacted live branches ({s}; {d}->{d})\n", .{
+                reason, before_entries, self.entries.items.len,
+            });
+            self.logResident();
+        }
         return .{
             .entries_before = before_entries,
             .entries_after = self.entries.items.len,
@@ -952,6 +1150,8 @@ pub const HotPrefixCache = struct {
         // survives on disk would be immortal across restarts.
         if (self.disk) |*d| d.invalidateAll();
         self.disk_dirty = false;
+        self.active_lease_id = 0;
+        self.active_lease_deadline_ms = 0;
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -1052,6 +1252,105 @@ test "HotPrefixCache: pressure compaction retains only newest live branch" {
     try testing.expectEqual(@as(u64, 600), result.bytes_before);
     try testing.expectEqual(@as(u64, 300), result.bytes_after);
     try testing.expectEqual(@as(u32, 2), cache.entries.items[0].tokens[0]);
+}
+
+test "HotPrefixCache: a live foreground lease is exclusive until release" {
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+
+    try testing.expect(cache.claimLease(0xaaa, 10_000, 100));
+    try testing.expect(cache.claimLease(0xaaa, 20_000, 200));
+    try testing.expect(!cache.claimLease(0xbbb, 20_000, 200));
+    try testing.expect(!cache.releaseLease(0xbbb));
+    try testing.expect(cache.releaseLease(0xaaa));
+    try testing.expect(cache.claimLease(0xbbb, 20_000, 200));
+}
+
+test "HotPrefixCache: denied nested request cannot acquire lease at commit" {
+    const s = mlx.gpuStream();
+    var source = try KVCache.init(testing.allocator, 1);
+    defer source.deinit();
+    try testFillCache(&source, s, 1, 4);
+
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+
+    try testing.expect(cache.claimLease(0xaaa, 10_000, 100));
+    const nested_owned = cache.claimLease(0xbbb, 10_000, 200);
+    try testing.expect(!nested_owned);
+    try testing.expect(cache.releaseLease(0xaaa));
+
+    // The parent may release while this nested generation is still running.
+    // Commit consumes the admission decision instead of trying to claim again.
+    try cache.commitWithStateLease(
+        &source,
+        &[_]u32{ 1, 2, 3, 4 },
+        false,
+        0,
+        null,
+        null,
+        null,
+        0xbbb,
+        nested_owned,
+        300,
+    );
+
+    try testing.expectEqual(@as(u64, 0), cache.active_lease_id);
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), cache.entries.items[0].cache_lease_id);
+}
+
+test "HotPrefixCache: pressure preserves foreground branch over newer nested branch" {
+    var cache = HotPrefixCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testing.expect(cache.claimLease(0xaaa, 10_000, 100));
+
+    for ([_]struct { token: u32, last_used: u64, bytes: u64, lease: u64 }{
+        .{ .token = 93, .last_used = 2, .bytes = 400, .lease = 0xaaa },
+        .{ .token = 34, .last_used = 9, .bytes = 200, .lease = 0 },
+        .{ .token = 35, .last_used = 10, .bytes = 200, .lease = 0 },
+    }) |item| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{item.token}),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = item.last_used,
+            .cache_lease_id = item.lease,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = item.bytes,
+        });
+        cache.current_kv_bytes += item.bytes;
+    }
+
+    const result = cache.retainProtectedOrNewest("test pressure", 200);
+    try testing.expectEqual(@as(usize, 1), result.entries_after);
+    try testing.expectEqual(@as(u64, 400), result.bytes_after);
+    try testing.expectEqual(@as(u32, 93), cache.entries.items[0].tokens[0]);
+}
+
+test "HotPrefixCache: count eviction skips the foreground branch" {
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testing.expect(cache.claimLease(0xaaa, 10_000, 100));
+
+    for ([_]struct { token: u32, last_used: u64, lease: u64 }{
+        .{ .token = 93, .last_used = 1, .lease = 0xaaa },
+        .{ .token = 34, .last_used = 9, .lease = 0 },
+    }) |item| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{item.token}),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = item.last_used,
+            .cache_lease_id = item.lease,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+        });
+    }
+
+    try testing.expect(cache.evictOneLru("count cap", 200));
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expectEqual(@as(u32, 93), cache.entries.items[0].tokens[0]);
 }
 
 test "HotPrefixCache: findBestMatch returns longest shared prefix" {

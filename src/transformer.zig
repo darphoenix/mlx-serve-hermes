@@ -33447,6 +33447,10 @@ test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, c
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    // This test covers the custom msv_attn_p256 kernel, not the preferred
+    // stock NAX causal backend used by production on supported GPUs.
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x256256);
     const rnd = prng.random();
 
@@ -33656,17 +33660,16 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     try std.testing.expect((try fusedSdpa256Prefill(s, q, q, q, 1.0, 0)) == null);
 }
 
-test "fusedSdpa256Prefill: causal and band both default FUSED (budgeted-dispatch flip)" {
+test "fusedSdpa256Prefill: NAX preference owns causal while custom kernel keeps band" {
     const s = mlx.gpuStream();
+    nax_sdpa_override = true;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x4A7E);
     const rnd = prng.random();
 
-    // No override, no env: BOTH arms engage. The causal arm's historical
-    // net-loss (every pre-budget ratio-gated variant lost same-boot on the
-    // 27B) was the IOGPU preemption class — with the kv-chunk dispatch
-    // budget it wins live (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6%
-    // at 8K/16K/32K on the 27B), so causal is default-on now.
-    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal.
+    // MLX's NAX fused SDPA owns plain causal attention on supported GPUs.
+    // msv_attn_p256 still owns the sliding-band arm because NAX does not
+    // accept a band mask. Keep this routing test deterministic on every Mac.
     std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -33676,7 +33679,7 @@ test "fusedSdpa256Prefill: causal and band both default FUSED (budgeted-dispatch
     defer _ = mlx.mlx_array_free(k);
 
     const causal = try fusedSdpa256Prefill(s, q, k, k, 1.0, 0);
-    try std.testing.expect(causal != null);
+    try std.testing.expect(causal == null);
     if (causal) |f| _ = mlx.mlx_array_free(f);
 
     const banded = try fusedSdpa256Prefill(s, q, k, k, 1.0, 40);
@@ -33702,6 +33705,8 @@ test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single d
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0xC4A2);
     const rnd = prng.random();
 
@@ -33802,6 +33807,8 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x27B27B);
     const rnd = prng.random();
 

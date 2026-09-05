@@ -657,6 +657,14 @@ pub const StoredResponse = struct {
     qwen_late: bool = false,
     qwen_late_has_vision: bool = false,
     qwen_late_has_non_image_media: bool = false,
+    /// Effective tool policy used for this response. The active definitions
+    /// let a continuation prove that resending the same tools is redundant;
+    /// the registry retains definitions seen earlier in the exact lineage so
+    /// a narrowed policy can later expand without replaying every schema.
+    qwen_late_active_tools_json: []u8 = &.{},
+    qwen_late_tool_registry_json: []u8 = &.{},
+    qwen_late_tool_choice_instruction: []u8 = &.{},
+    qwen_late_tools_active: bool = false,
     durable_instructions: []u8 = &.{},
     runtime_instructions: []u8 = &.{},
     reasoning_effort: []u8 = &.{},

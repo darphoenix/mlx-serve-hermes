@@ -243,6 +243,11 @@ pub const SubmitParams = struct {
     /// Token-authentic late-tool renderers may pin this because their schema
     /// already participates in exact prompt-token matching.
     cache_has_tools: ?bool = null,
+    /// Exclusive foreground-turn cache lease. Zero means ordinary LRU work.
+    /// The deadline is monotonic milliseconds and exists only as a crash
+    /// fallback; Hermes releases the lease explicitly when the turn ends.
+    cache_lease_id: u64 = 0,
+    cache_lease_deadline_ms: i64 = 0,
     /// The server's final resolved thinking mode after request overrides and
     /// model defaults. DFlash economics key off this, not tool presence.
     enable_thinking: bool = false,
@@ -383,6 +388,11 @@ pub const Slot = struct {
     timeout_ns: u64,
     has_tools: bool,
     cache_has_tools: bool = false,
+    cache_lease_id: u64 = 0,
+    cache_lease_deadline_ms: i64 = 0,
+    /// Lease ownership latched during prefix-cache lookup. A nested request
+    /// denied at admission can never become the owner during its later commit.
+    cache_lease_owned: bool = false,
     enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
@@ -561,6 +571,9 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .cache_has_tools = resolvedCacheHasTools(params.has_tools, params.cache_has_tools),
+            .cache_lease_id = params.cache_lease_id,
+            .cache_lease_deadline_ms = params.cache_lease_deadline_ms,
+            .cache_lease_owned = false,
             .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
             // Qwen's external drafter does not yet carry M-RoPE positions.
@@ -1084,12 +1097,14 @@ pub const PrefixCacheCompactResult = struct {
     entries_after: usize = 0,
     bytes_before: u64 = 0,
     bytes_after: u64 = 0,
+    lease_released: bool = false,
 };
 
 /// Cross-process pressure-reclaim request. Prefix-cache arrays belong to the
 /// inference stream, so an HTTP connection thread posts this work instead of
 /// releasing MLX references directly.
 pub const PrefixCacheCompactRequest = struct {
+    release_lease_id: u64 = 0,
     result: PrefixCacheCompactResult = .{},
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
@@ -1967,6 +1982,25 @@ pub const Scheduler = struct {
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
         req.done_mu.unlock(self.io);
         return req.result;
+    }
+
+    /// Release a foreground cache lease on the inference thread. The request
+    /// shares the lightweight cache-maintenance queue with compaction so no
+    /// connection thread races prefix-cache mutation.
+    pub fn releasePrefixCacheLease(self: *Scheduler, lease_id: u64) !bool {
+        if (lease_id == 0) return false;
+        var req = PrefixCacheCompactRequest{ .release_lease_id = lease_id };
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.prefix_cache_compact_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+        return req.result.lease_released;
     }
 
     /// Synchronously compute embeddings for `req.token_seqs` using the
@@ -4406,16 +4440,24 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
 
 fn runPrefixCacheCompactRequest(sch: *Scheduler, req: *PrefixCacheCompactRequest) void {
     if (sch.hot_prefix_cache) |cache| {
-        const retained = cache.retainNewest("sidecar memory pressure");
-        req.result = .{
-            .cache_available = true,
-            .entries_before = retained.entries_before,
-            .entries_after = retained.entries_after,
-            .bytes_before = retained.bytes_before,
-            .bytes_after = retained.bytes_after,
-        };
-        if (retained.bytes_after < retained.bytes_before) {
-            _ = mlx.mlx_clear_cache();
+        if (req.release_lease_id != 0) {
+            req.result.cache_available = true;
+            req.result.lease_released = cache.releaseLease(req.release_lease_id);
+        } else {
+            const retained = cache.retainProtectedOrNewest(
+                "sidecar memory pressure",
+                io_util.nowMsMonotonic(sch.io),
+            );
+            req.result = .{
+                .cache_available = true,
+                .entries_before = retained.entries_before,
+                .entries_after = retained.entries_after,
+                .bytes_before = retained.bytes_before,
+                .bytes_after = retained.bytes_after,
+            };
+            if (retained.bytes_after < retained.bytes_before) {
+                _ = mlx.mlx_clear_cache();
+            }
         }
     }
     req.done_mu.lockUncancelable(sch.io);
@@ -4597,7 +4639,18 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         };
         break :blk .{ .cache = mc.kv() orelse break :blk null, .base_pos = gen_ptr.mtp_position_base };
     };
-    hc.commitWithState(&slot.cache, total_tokens, slot.cache_has_tools, slot.vision_key, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithStateLease(
+        &slot.cache,
+        total_tokens,
+        slot.cache_has_tools,
+        slot.vision_key,
+        ssm_cps_opt,
+        dflash_commit,
+        mtp_commit,
+        slot.cache_lease_id,
+        slot.cache_lease_owned,
+        io_util.nowMsMonotonic(sch.io),
+    ) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
@@ -4637,7 +4690,18 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     if (slot.ssm_entries != null) return;
     const step: usize = @intCast(slot.cache.step);
     const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
-    hc.commitWithState(&slot.cache, slot.full_prompt[0..len], slot.cache_has_tools, slot.vision_key, null, null, null) catch |err| {
+    hc.commitWithStateLease(
+        &slot.cache,
+        slot.full_prompt[0..len],
+        slot.cache_has_tools,
+        slot.vision_key,
+        null,
+        null,
+        null,
+        slot.cache_lease_id,
+        slot.cache_lease_owned,
+        io_util.nowMsMonotonic(slot.io),
+    ) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5312,7 +5376,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
-            const lookup = hc.lookupAndRestore(
+            const lookup = hc.lookupAndRestoreWithLease(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5322,10 +5386,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.vision_key,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
+                slot.cache_lease_id,
+                slot.cache_lease_deadline_ms,
+                io_util.nowMsMonotonic(sch.io),
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
+            slot.cache_lease_owned = lookup.lease_owned;
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];

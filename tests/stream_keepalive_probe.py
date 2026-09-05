@@ -93,8 +93,11 @@ elapsed = time.time() - t0
 text = raw.decode("utf-8", "replace")
 
 beats = text.count(": keepalive") + text.count("event: ping")
+responses_progress_events = text.count("event: response.in_progress")
+responses_heartbeat_events = max(0, responses_progress_events - 1)
 print(f"elapsed={elapsed:.1f}s bytes={len(raw)} max_gap={max_gap:.1f}s "
-      f"(at t={max_gap_at:.1f}s) keepalives={beats}")
+      f"(at t={max_gap_at:.1f}s) keepalives={beats} "
+      f"responses_heartbeats={responses_heartbeat_events}")
 
 # ── Did we actually exercise a long buffered span? ──
 if elapsed < MIN_BUFFER_S:
@@ -111,6 +114,8 @@ if max_gap > MAX_GAP_S:
 # 2. The heartbeat actually fired.
 if beats == 0:
     failures.append("no keepalive/ping observed on the stream")
+if SURFACE == "responses" and responses_heartbeat_events == 0:
+    failures.append("Responses keepalive was only an SSE comment; SDK event iterators cannot observe it")
 
 # 3. The tool call survived the injected bytes: name intact, args valid JSON.
 args = None

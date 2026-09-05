@@ -650,6 +650,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/cache/compact",
+    "/v1/cache/lease/release",
     "/v1/completions",
     "/v1/embeddings",
     "/v1/images/edits",
@@ -1618,7 +1619,9 @@ fn handleConnection(
     // Needed before model resolution, not just at the handler: `/v1/images/edits`
     // carries its model in a multipart FIELD, which only the content-type's
     // boundary lets us find (`parseModelFromRequest`).
-    const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
+    const request_headers = request[0..header_end_pos];
+    const request_content_type = findHeaderValue(request_headers, "content-type") orelse "";
+    const cache_lease = parseHermesCacheLease(request_headers, stream.io);
     logHttpRequest(method, raw_path, request_body);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
@@ -1747,6 +1750,10 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/cache/compact")) {
         try handleCacheCompact(allocator, stream);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/cache/lease/release")) {
+        try handleCacheLeaseRelease(allocator, stream, request_headers);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/load-model")) {
@@ -1990,7 +1997,7 @@ fn handleConnection(
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleResponses(allocator, stream, body, lm);
+        try handleResponses(allocator, stream, body, lm, cache_lease);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3169,13 +3176,14 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
-        defer allocator.free(msg);
-        if (is_anthropic) {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
-        } else {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
-        }
+        try sendContextCapacityError(
+            allocator,
+            stream,
+            prompt_len,
+            needed,
+            available,
+            is_anthropic,
+        );
         return false;
     }
     return true;
@@ -5812,7 +5820,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, null, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, null, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6132,6 +6140,7 @@ fn nonStreamingViaScheduler(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    cache_lease: CacheLease,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -6144,6 +6153,8 @@ fn nonStreamingViaScheduler(
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
         .cache_has_tools = cache_has_tools,
+        .cache_lease_id = cache_lease.id,
+        .cache_lease_deadline_ms = cache_lease.deadline_ms,
         .enable_thinking = enable_thinking,
         .sampling = sampling,
         .eos_token_ids = eos_token_ids,
@@ -6295,7 +6306,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -7455,8 +7466,10 @@ fn handleStreamingGeneration(
                 // to a UTF-8 boundary — a flush cut mid-codepoint ships a lone
                 // continuation byte in the delta JSON (live hy_v3 2026-07-14:
                 // `"reasoning_content":"2\xc2"` — '²' split across deltas).
-                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
-                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
+                const safe_len = utf8BoundaryAtOrBefore(
+                    think_buf.items,
+                    think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items),
+                );
                 if (safe_len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -8176,6 +8189,33 @@ fn findHeaderValue(headers: []const u8, comptime name_lower: []const u8) ?[]cons
         if (match) return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
     }
     return null;
+}
+
+const CacheLease = struct {
+    id: u64 = 0,
+    deadline_ms: i64 = 0,
+};
+
+// Explicit release is the normal lifecycle. This only recovers a lease after
+// a crashed Hermes process, and is deliberately much longer than an ordinary
+// agent turn so legitimate long tool work cannot lose its parent checkpoint.
+const foreground_cache_lease_ttl_ms: i64 = 6 * 60 * 60 * 1000;
+
+fn hermesCacheLeaseId(headers: []const u8) ?u64 {
+    const actor = findHeaderValue(headers, "x-hermes-actor") orelse return null;
+    if (!std.ascii.eqlIgnoreCase(actor, "main")) return null;
+    const raw = findHeaderValue(headers, "x-hermes-cache-lease") orelse return null;
+    if (raw.len == 0) return null;
+    const digest = std.hash.Wyhash.hash(0x4845_524d_4553_4c53, raw);
+    return if (digest == 0) 1 else digest;
+}
+
+fn parseHermesCacheLease(headers: []const u8, io: std.Io) CacheLease {
+    const id = hermesCacheLeaseId(headers) orelse return .{};
+    return .{
+        .id = id,
+        .deadline_ms = io_util.nowMsMonotonic(io) + foreground_cache_lease_ttl_ms,
+    };
 }
 
 // ── API-key auth helpers (used only when --api-key / g_api_key is set) ──
@@ -8929,6 +8969,65 @@ fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u
     ) catch "Prompt exceeds maximum context length";
 }
 
+fn contextCapacityErrorBody(
+    allocator: std.mem.Allocator,
+    prompt_tokens: usize,
+    required_memory_bytes: u64,
+    available_memory_bytes: u64,
+) ![]u8 {
+    const required_mb = required_memory_bytes / (1024 * 1024);
+    const available_mb = available_memory_bytes / (1024 * 1024);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"error\":{{\"message\":\"Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available. Compact or reduce the prompt and retry.\",\"type\":\"context_overflow_error\",\"param\":null,\"code\":\"context_overflow\",\"reason\":\"memory_capacity\",\"prompt_tokens\":{d},\"required_memory_bytes\":{d},\"available_memory_bytes\":{d},\"retryable\":true}}}}",
+        .{
+            prompt_tokens,
+            required_mb,
+            available_mb,
+            prompt_tokens,
+            required_memory_bytes,
+            available_memory_bytes,
+        },
+    );
+}
+
+fn sendContextCapacityError(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    prompt_tokens: usize,
+    required_memory_bytes: u64,
+    available_memory_bytes: u64,
+    is_anthropic: bool,
+) !void {
+    const required_mb = required_memory_bytes / (1024 * 1024);
+    const available_mb = available_memory_bytes / (1024 * 1024);
+    if (is_anthropic) {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available. Compact or reduce the prompt and retry.",
+            .{ prompt_tokens, required_mb, available_mb },
+        );
+        defer allocator.free(msg);
+        try sendAnthropicError(
+            allocator,
+            stream,
+            "context_overflow_error",
+            msg,
+            400,
+        );
+        return;
+    }
+
+    const body = try contextCapacityErrorBody(
+        allocator,
+        prompt_tokens,
+        required_memory_bytes,
+        available_memory_bytes,
+    );
+    defer allocator.free(body);
+    try sendResponse(stream, "400 Bad Request", "application/json", body);
+}
+
 fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
@@ -8970,6 +9069,16 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
         else return 0; // invalid leading byte, don't buffer
     const actual = s.len - i;
     return if (actual < expected) actual else 0;
+}
+
+/// Move a requested byte cut backward when it lands inside a UTF-8 codepoint.
+/// Streaming buffers are valid UTF-8, but tag holdback works in bytes; without
+/// this adjustment a delta can end with lead bytes while the next starts with
+/// a continuation byte.
+fn utf8BoundaryAtOrBefore(s: []const u8, requested: usize) usize {
+    var end = @min(requested, s.len);
+    while (end > 0 and end < s.len and (s[end] & 0xC0) == 0x80) end -= 1;
+    return end;
 }
 
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
@@ -10507,6 +10616,53 @@ fn beatStreamKeepalive(stream: *Conn, style: KeepaliveStyle) !void {
     stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
 }
 
+/// Responses clients built on the OpenAI SDK never surface SSE comments to
+/// their event iterator. Keep the comment for generic proxies/clients, then
+/// follow it with a compact, schema-valid progress event so event-driven
+/// watchdogs can distinguish active buffered generation from a dead stream.
+/// WebSocket Responses already has transport-level liveness and must not gain
+/// duplicate application events merely because the SSE path needs a heartbeat.
+fn beatResponsesProgress(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    response_id_json: []const u8,
+    model_json: []const u8,
+    created_at: i64,
+) !void {
+    if (!stream.keepaliveDue()) return;
+    if (stream.ws_mode != null) {
+        stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
+        return;
+    }
+
+    try sendStreamKeepalive(stream);
+    const payload = try buildResponsesProgressPayload(
+        allocator,
+        response_id_json,
+        model_json,
+        created_at,
+    );
+    defer allocator.free(payload);
+    try sendResponsesEvent(allocator, stream, seq, "response.in_progress", payload);
+}
+
+/// Smallest Response object accepted by the Responses streaming schema. Avoid
+/// replaying instructions and tool schemas every five seconds: those can be
+/// tens of kilobytes in an agent request and are irrelevant to liveness.
+fn buildResponsesProgressPayload(
+    allocator: std.mem.Allocator,
+    response_id_json: []const u8,
+    model_json: []const u8,
+    created_at: i64,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"response.in_progress\",\"response\":{{\"id\":{s},\"created_at\":{d},\"model\":{s},\"object\":\"response\",\"output\":[],\"parallel_tool_calls\":true,\"tool_choice\":\"auto\",\"tools\":[],\"status\":\"in_progress\"}}}}",
+        .{ response_id_json, created_at, model_json },
+    );
+}
+
 fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
     if (stream.ws_mode) |bridge| {
         // WS transport: emit only the JSON payload as a text frame; the
@@ -11304,7 +11460,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -12008,8 +12164,10 @@ fn handleAnthropicStreaming(
                 // Hold back a still-growing partial close tag (suffixed forms
                 // included), then back off to a UTF-8 boundary — a cut mid-
                 // codepoint ships a lone continuation byte in the delta JSON.
-                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
-                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
+                const safe_len = utf8BoundaryAtOrBefore(
+                    think_buf.items,
+                    think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items),
+                );
                 if (safe_len > 0) {
                     try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -12458,15 +12616,321 @@ fn appendHermesQwenLateToolBlock(
     }
 }
 
-fn qwenLateDeltaSupported(messages: []const chat_mod.Message) bool {
+fn jsonValuesStructurallyEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+    return switch (lhs) {
+        .null => true,
+        .bool => |value| value == rhs.bool,
+        .integer => |value| value == rhs.integer,
+        .float => |value| value == rhs.float,
+        .number_string => |value| std.mem.eql(u8, value, rhs.number_string),
+        .string => |value| std.mem.eql(u8, value, rhs.string),
+        .array => |array| blk: {
+            if (array.items.len != rhs.array.items.len) break :blk false;
+            for (array.items, rhs.array.items) |left, right| {
+                if (!jsonValuesStructurallyEqual(left, right)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (object.count() != rhs.object.count()) break :blk false;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                const right = rhs.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!jsonValuesStructurallyEqual(entry.value_ptr.*, right)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn qwenLateToolName(tool: std.json.Value) ?[]const u8 {
+    if (tool != .object) return null;
+    const function = tool.object.get("function") orelse return null;
+    if (function != .object) return null;
+    const name = function.object.get("name") orelse return null;
+    return if (name == .string and name.string.len > 0) name.string else null;
+}
+
+fn qwenLateFindToolByName(tools: std.json.Array, name: []const u8) ?std.json.Value {
+    for (tools.items) |tool| {
+        const candidate = qwenLateToolName(tool) orelse continue;
+        if (std.mem.eql(u8, candidate, name)) return tool;
+    }
+    return null;
+}
+
+fn qwenLateToolJsonStructurallyEqual(lhs_json: []const u8, rhs_json: []const u8) bool {
+    if (lhs_json.len == 0 or rhs_json.len == 0) return lhs_json.len == rhs_json.len;
+    const allocator = std.heap.page_allocator;
+    const lhs = std.json.parseFromSlice(std.json.Value, allocator, lhs_json, .{}) catch return false;
+    defer lhs.deinit();
+    const rhs = std.json.parseFromSlice(std.json.Value, allocator, rhs_json, .{}) catch return false;
+    defer rhs.deinit();
+    return jsonValuesStructurallyEqual(lhs.value, rhs.value);
+}
+
+fn qwenLateToolPolicyUnchanged(
+    previous_tools_json: []const u8,
+    previous_tool_choice_instruction: []const u8,
+    previous_tools_active: bool,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+) bool {
+    const tools_active = tools_json != null;
+    if (previous_tools_active != tools_active) return false;
+    if (!std.mem.eql(
+        u8,
+        previous_tool_choice_instruction,
+        tool_choice_instruction orelse "",
+    )) return false;
+    if (!tools_active) return true;
+    return qwenLateToolJsonStructurallyEqual(
+        previous_tools_json,
+        tools_json.?,
+    );
+}
+
+fn buildHermesQwenLateToolSchemaDelta(
+    allocator: std.mem.Allocator,
+    registry_json: []const u8,
+    tools_json: []const u8,
+) !?[]u8 {
+    if (registry_json.len == 0) return try allocator.dupe(u8, tools_json);
+
+    const registry = std.json.parseFromSlice(std.json.Value, allocator, registry_json, .{}) catch
+        return try allocator.dupe(u8, tools_json);
+    defer registry.deinit();
+    const current = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch
+        return try allocator.dupe(u8, tools_json);
+    defer current.deinit();
+    if (registry.value != .array or current.value != .array)
+        return try allocator.dupe(u8, tools_json);
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    var emitted: usize = 0;
+    for (current.value.array.items) |tool| {
+        const name = qwenLateToolName(tool);
+        const known = if (name) |tool_name|
+            qwenLateFindToolByName(registry.value.array, tool_name)
+        else
+            null;
+        if (known != null and jsonValuesStructurallyEqual(known.?, tool)) continue;
+        if (emitted > 0) try buf.append(allocator, ',');
+        try responses_mod.serializeJsonValue(allocator, &buf, tool);
+        emitted += 1;
+    }
+    try buf.append(allocator, ']');
+    if (emitted == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn buildHermesQwenLateToolRegistry(
+    allocator: std.mem.Allocator,
+    previous_registry_json: []const u8,
+    tools_json: ?[]const u8,
+) ![]u8 {
+    const current_json = tools_json orelse "[]";
+    if (previous_registry_json.len == 0) return try allocator.dupe(u8, current_json);
+    if (tools_json == null) return try allocator.dupe(u8, previous_registry_json);
+
+    const previous = std.json.parseFromSlice(std.json.Value, allocator, previous_registry_json, .{}) catch
+        return try allocator.dupe(u8, current_json);
+    defer previous.deinit();
+    const current = std.json.parseFromSlice(std.json.Value, allocator, current_json, .{}) catch
+        return try allocator.dupe(u8, current_json);
+    defer current.deinit();
+    if (previous.value != .array or current.value != .array)
+        return try allocator.dupe(u8, current_json);
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    var emitted: usize = 0;
+    for (previous.value.array.items) |tool| {
+        const name = qwenLateToolName(tool);
+        const replaced = if (name) |tool_name|
+            qwenLateFindToolByName(current.value.array, tool_name) != null
+        else
+            false;
+        if (replaced) continue;
+        if (emitted > 0) try buf.append(allocator, ',');
+        try responses_mod.serializeJsonValue(allocator, &buf, tool);
+        emitted += 1;
+    }
+    for (current.value.array.items) |tool| {
+        if (emitted > 0) try buf.append(allocator, ',');
+        try responses_mod.serializeJsonValue(allocator, &buf, tool);
+        emitted += 1;
+    }
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn appendHermesQwenLateToolSchemaUpdates(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    schema_delta_json: []const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, schema_delta_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len == 0) return;
+
+    try buf.appendSlice(
+        allocator,
+        "<|im_start|>system\n# Tool schema updates\n\n" ++
+            "These function definitions are new or replace earlier definitions:\n\n<tools>",
+    );
+    for (parsed.value.array.items) |tool| {
+        try buf.append(allocator, '\n');
+        try responses_mod.serializeJsonValue(allocator, buf, tool);
+    }
+    try buf.appendSlice(allocator, "\n</tools><|im_end|>\n");
+}
+
+fn appendHermesQwenLateCompactToolPolicy(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    tools_json: []const u8,
+    tool_choice_instruction: ?[]const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len == 0) return;
+
+    try buf.appendSlice(
+        allocator,
+        "<|im_start|>system\n# Tool policy for this response\n\n" ++
+            "Available function names: [",
+    );
+    var emitted: usize = 0;
+    for (parsed.value.array.items) |tool| {
+        const name = qwenLateToolName(tool) orelse continue;
+        if (emitted > 0) try buf.append(allocator, ',');
+        const escaped = try jsonEscape(allocator, name);
+        defer allocator.free(escaped);
+        try buf.appendSlice(allocator, escaped);
+        emitted += 1;
+    }
+    try buf.appendSlice(
+        allocator,
+        "]. Use only functions in this list. Schemas declared earlier in the " ++
+            "conversation, including updates immediately above, remain authoritative.",
+    );
+    if (tool_choice_instruction) |instruction| {
+        const trimmed = std.mem.trim(u8, instruction, " \t\r\n");
+        if (trimmed.len > 0) {
+            try buf.appendSlice(allocator, "\n\n");
+            try buf.appendSlice(allocator, trimmed);
+        }
+    }
+    try buf.appendSlice(allocator, "<|im_end|>\n");
+}
+
+const HermesQwenLateToolTransition = enum {
+    reused,
+    disabled,
+    policy_only,
+    schema_update,
+};
+
+fn appendHermesQwenLateToolTransition(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    previous_tools_json: []const u8,
+    previous_registry_json: []const u8,
+    previous_tool_choice_instruction: []const u8,
+    previous_tools_active: bool,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+) !HermesQwenLateToolTransition {
+    if (qwenLateToolPolicyUnchanged(
+        previous_tools_json,
+        previous_tool_choice_instruction,
+        previous_tools_active,
+        tools_json,
+        tool_choice_instruction,
+    ))
+        return .reused;
+
+    if (tools_json == null) {
+        try appendHermesQwenLateToolBlock(allocator, buf, null, null, true);
+        return .disabled;
+    }
+
+    // A response restored from an older build (or a lineage that previously
+    // had no tools) has no authoritative schema registry. Emit the canonical
+    // Qwen tool block once so the function-call syntax and every definition
+    // are established before later turns use compact policy deltas.
+    if (previous_registry_json.len == 0) {
+        try appendHermesQwenLateToolBlock(
+            allocator,
+            buf,
+            tools_json,
+            tool_choice_instruction,
+            true,
+        );
+        return .schema_update;
+    }
+
+    const schema_delta = try buildHermesQwenLateToolSchemaDelta(
+        allocator,
+        previous_registry_json,
+        tools_json.?,
+    );
+    defer if (schema_delta) |delta| allocator.free(delta);
+    if (schema_delta) |delta| {
+        try appendHermesQwenLateToolSchemaUpdates(allocator, buf, delta);
+    }
+    try appendHermesQwenLateCompactToolPolicy(
+        allocator,
+        buf,
+        tools_json.?,
+        tool_choice_instruction,
+    );
+    return if (schema_delta != null) .schema_update else .policy_only;
+}
+
+fn qwenLateDeltaRejectReason(messages: []const chat_mod.Message) ?[]const u8 {
     // A transient repair can branch from a stored response with no durable
     // chat delta. Its runtime instruction and current tool policy are appended
     // separately by buildHermesQwenLateContinuationPrompt.
     for (messages) |message| {
-        if (message.images != null or message.videos != null or message.audio != null) return false;
-        if (!std.mem.eql(u8, message.role, "user") and !std.mem.eql(u8, message.role, "tool")) return false;
+        if (message.images != null or message.videos != null or message.audio != null) return "delta_media";
+        if (std.mem.eql(u8, message.role, "user") or std.mem.eql(u8, message.role, "tool")) continue;
+        if (std.mem.eql(u8, message.role, "assistant")) {
+            // Hermes records an interrupted in-flight response as a plain
+            // assistant checkpoint followed by the user's correction. It is
+            // ordinary append-only history and must not force a full prompt
+            // rebuild. Rich assistant records still fail closed because this
+            // renderer cannot prove their tool/reasoning serialization is
+            // token-identical to the model's chat template.
+            if (message.tool_calls != null) return "delta_assistant_tool_calls";
+            if (message.tool_call_id != null or message.reasoning_content != null) return "delta_assistant_metadata";
+            continue;
+        }
+        return "delta_unsupported_role";
     }
-    return true;
+    return null;
+}
+
+fn qwenLateDeltaSupported(messages: []const chat_mod.Message) bool {
+    return qwenLateDeltaRejectReason(messages) == null;
+}
+
+fn qwenLateContinuationRejectReason(
+    previous: *const responses_mod.StoredResponse,
+    appended_messages: []const chat_mod.Message,
+) ?[]const u8 {
+    if (!previous.qwen_late) return "previous_not_qwen_late";
+    if (previous.qwen_late_has_non_image_media) return "previous_non_image_media";
+    if (previous.qwen_late_tokens.len == 0) return "previous_tokens_empty";
+    return qwenLateDeltaRejectReason(appended_messages);
 }
 
 fn messagesHaveImages(messages: []const chat_mod.Message) bool {
@@ -12520,6 +12984,17 @@ fn appendHermesQwenLateMessages(
             try buf.appendSlice(allocator, "<|im_end|>\n");
             continue;
         }
+        if (std.mem.eql(u8, message.role, "assistant") and
+            message.tool_calls == null and
+            message.tool_call_id == null and
+            message.reasoning_content == null)
+        {
+            try buf.appendSlice(allocator, "\n<|im_start|>assistant\n");
+            try buf.appendSlice(allocator, std.mem.trim(u8, message.content, " \t\r\n"));
+            try buf.appendSlice(allocator, "<|im_end|>\n");
+            i += 1;
+            continue;
+        }
         return error.UnsupportedQwenLateDelta;
     }
 }
@@ -12563,9 +13038,8 @@ fn buildHermesQwenLateContinuationPrompt(
     runtime_instructions: []const u8,
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
-    tools_explicit: bool,
 ) !?[]u32 {
-    if (!previous.qwen_late or previous.qwen_late_has_non_image_media or previous.qwen_late_tokens.len == 0 or !qwenLateDeltaSupported(appended_messages)) return null;
+    if (qwenLateContinuationRejectReason(previous, appended_messages) != null) return null;
 
     var delta = std.ArrayList(u8).empty;
     defer delta.deinit(allocator);
@@ -12577,7 +13051,20 @@ fn buildHermesQwenLateContinuationPrompt(
         previous.runtime_instructions,
         true,
     );
-    try appendHermesQwenLateToolBlock(allocator, &delta, tools_json, tool_choice_instruction, tools_explicit);
+    const tool_transition = try appendHermesQwenLateToolTransition(
+        allocator,
+        &delta,
+        previous.qwen_late_active_tools_json,
+        previous.qwen_late_tool_registry_json,
+        previous.qwen_late_tool_choice_instruction,
+        previous.qwen_late_tools_active,
+        tools_json,
+        tool_choice_instruction,
+    );
+    log.info(
+        "[hermes-qwen-late] tool transition prev={s} mode={s} active_tools={} delta_chars={d}\n",
+        .{ previous.id, @tagName(tool_transition), tools_json != null, delta.items.len },
+    );
     try delta.appendSlice(allocator, qwenLateGenerationTail(enable_thinking));
 
     const delta_ids = try tok.encode(allocator, delta.items);
@@ -12736,11 +13223,37 @@ fn handleCacheCompact(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", out);
 }
 
+fn handleCacheLeaseRelease(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    headers: []const u8,
+) !void {
+    const lease_id = hermesCacheLeaseId(headers) orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing foreground cache lease header", 400);
+        return;
+    };
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_unavailable", "Scheduler is not available", 503);
+        return;
+    };
+    const released = scheduler.releasePrefixCacheLease(lease_id) catch |err| {
+        log.warn("POST /v1/cache/lease/release -> 503 ({s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "cache_lease_release_failed", "Prefix cache lease release failed", 503);
+        return;
+    };
+    log.info("POST /v1/cache/lease/release -> 200 (released={})\n", .{released});
+    try sendResponse(stream, "200 OK", "application/json", if (released)
+        "{\"status\":\"ok\",\"released\":true}"
+    else
+        "{\"status\":\"ok\",\"released\":false}");
+}
+
 fn handleResponses(
     allocator: std.mem.Allocator,
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+    cache_lease: CacheLease,
 ) !void {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
@@ -13005,6 +13518,7 @@ fn handleResponses(
         isHermesQwenLateTemplate(chat_config.chat_template) and
         lm.ds4_engine == null and lm.llama_engine == null;
     var qwen_late_used = false;
+    var qwen_late_exact_continuation_used = false;
     var qwen_late_inherited_vision = false;
 
     var tokenize_sw = Stopwatch.init(stream.io);
@@ -13019,34 +13533,51 @@ fn handleResponses(
                 previous.enable_thinking == enable_thinking and
                 std.mem.eql(u8, previous.reasoning_effort, effort) and
                 pi.messages.items.len >= previous.history.len;
+            var rebuild_reason: []const u8 = if (!instructions_compatible)
+                "instructions_changed"
+            else if (!std.mem.eql(u8, previous.model, model_name))
+                "model_changed"
+            else if (previous.enable_thinking != enable_thinking)
+                "thinking_changed"
+            else if (!std.mem.eql(u8, previous.reasoning_effort, effort))
+                "reasoning_effort_changed"
+            else if (pi.messages.items.len < previous.history.len)
+                "history_shorter_than_parent"
+            else
+                "unknown";
             if (exact_compatible) {
                 const appended = pi.messages.items[previous.history.len..];
-                if (try buildHermesQwenLateContinuationPrompt(
-                    allocator,
-                    tok,
-                    previous,
-                    appended,
-                    enable_thinking,
-                    runtime_instructions,
-                    active_tools_json,
-                    active_tool_choice_instruction,
-                    tools_explicit,
-                )) |exact_prompt| {
-                    prompt_ids_raw = exact_prompt;
-                    qwen_late_used = true;
-                    qwen_late_inherited_vision = previous.qwen_late_has_vision;
-                    log.info("[hermes-qwen-late] exact continuation prev={s} base={d} prompt={d} delta_messages={d} tools={} runtime_chars={d}\n", .{
-                        previous.id,
-                        previous.qwen_late_tokens.len,
-                        exact_prompt.len,
-                        appended.len,
-                        active_has_tools,
-                        runtime_instructions.len,
-                    });
-                    break :qwen_late;
+                if (qwenLateContinuationRejectReason(previous, appended)) |reason| {
+                    rebuild_reason = reason;
+                } else {
+                    if (try buildHermesQwenLateContinuationPrompt(
+                        allocator,
+                        tok,
+                        previous,
+                        appended,
+                        enable_thinking,
+                        runtime_instructions,
+                        active_tools_json,
+                        active_tool_choice_instruction,
+                    )) |exact_prompt| {
+                        prompt_ids_raw = exact_prompt;
+                        qwen_late_used = true;
+                        qwen_late_exact_continuation_used = true;
+                        qwen_late_inherited_vision = previous.qwen_late_has_vision;
+                        log.info("[hermes-qwen-late] exact continuation prev={s} base={d} prompt={d} delta_messages={d} tools={} runtime_chars={d}\n", .{
+                            previous.id,
+                            previous.qwen_late_tokens.len,
+                            exact_prompt.len,
+                            appended.len,
+                            active_has_tools,
+                            runtime_instructions.len,
+                        });
+                        break :qwen_late;
+                    }
+                    rebuild_reason = "continuation_builder_declined";
                 }
             }
-            log.info("[hermes-qwen-late] full rebuild prev={s} reason=exact_incompatible\n", .{previous.id});
+            log.info("[hermes-qwen-late] full rebuild prev={s} reason={s}\n", .{ previous.id, rebuild_reason });
         }
 
         const base_prompt = try cachedFormatChat(
@@ -13161,6 +13692,7 @@ fn handleResponses(
     // ── pre-allocate response id (used in streaming envelopes too) ──
     const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
     defer allocator.free(resp_id);
+    const response_created_at = nowSecs(stream.io);
     const esc_resp_id = try jsonEscape(allocator, resp_id);
     defer allocator.free(esc_resp_id);
     const esc_model = try jsonEscape(allocator, model_name);
@@ -13337,6 +13869,8 @@ fn handleResponses(
             .cached_tokens = 0,
             .has_tools = active_has_tools,
             .cache_has_tools = if (qwen_late_used) false else null,
+            .cache_lease_id = cache_lease.id,
+            .cache_lease_deadline_ms = cache_lease.deadline_ms,
             .enable_thinking = enable_thinking,
             .sampling = sampling,
             .eos_token_ids = eos_slice,
@@ -13397,7 +13931,14 @@ fn handleResponses(
                         client_gone = true;
                         break;
                     }
-                    sendStreamKeepalive(stream) catch {
+                    beatResponsesProgress(
+                        allocator,
+                        stream,
+                        &seq_num,
+                        esc_resp_id,
+                        esc_model,
+                        response_created_at,
+                    ) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                         slot_handle.?.cancel();
                         client_gone = true;
@@ -13458,7 +13999,14 @@ fn handleResponses(
             // emits nothing for its whole generation, and the thinking branch
             // holds until its close tag. Both look identical to a dead server
             // from the client's socket.
-            beatStreamKeepalive(stream, .sse_comment) catch {
+            beatResponsesProgress(
+                allocator,
+                stream,
+                &seq_num,
+                esc_resp_id,
+                esc_model,
+                response_created_at,
+            ) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 slot_handle.?.cancel();
                 client_gone = true;
@@ -13560,10 +14108,14 @@ fn handleResponses(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    // Hold back only bytes that can still grow into a close
+                    // tag, then keep the flush cut on a UTF-8 boundary. The
+                    // former fixed nine-byte cut split an em dash as E2 80 |
+                    // 94 across two Responses JSON events.
+                    const safe_len = utf8BoundaryAtOrBefore(
+                        think_buf.items,
+                        think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items),
+                    );
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -13630,7 +14182,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, if (qwen_late_used) false else null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, if (qwen_late_used) false else null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, cache_lease, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -13831,12 +14383,23 @@ fn handleResponses(
     if (should_store) {
         var qwen_late_frontier: ?[]u32 = null;
         defer if (qwen_late_frontier) |tokens| allocator.free(tokens);
+        var qwen_late_tool_registry_json: ?[]u8 = null;
+        defer if (qwen_late_tool_registry_json) |registry| allocator.free(registry);
         if (qwen_late_used) {
             qwen_late_frontier = try buildHermesQwenLateFrontier(
                 allocator,
                 tok,
                 prompt_ids,
                 result.token_ids,
+            );
+            const previous_registry = if (qwen_late_exact_continuation_used and prev_stored != null)
+                prev_stored.?.qwen_late_tool_registry_json
+            else
+                "";
+            qwen_late_tool_registry_json = try buildHermesQwenLateToolRegistry(
+                allocator,
+                previous_registry,
+                active_tools_json,
             );
         }
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
@@ -13852,6 +14415,10 @@ fn handleResponses(
             reasoning_text,
             stored_tool_calls,
             qwen_late_frontier,
+            if (qwen_late_used) active_tools_json orelse "" else "",
+            qwen_late_tool_registry_json orelse "",
+            if (qwen_late_used) active_tool_choice_instruction orelse "" else "",
+            qwen_late_used and active_has_tools,
             effective_durable_instructions,
             runtime_instructions,
             reasoning_cfg.effort orelse "",
@@ -14133,7 +14700,7 @@ fn handleResponsesWebSocket(
         defer stream.ws_mode = null;
 
         bridge.reset();
-        handleResponses(allocator, stream, body, lm) catch |err| {
+        handleResponses(allocator, stream, body, lm, .{}) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
             // Best-effort error frame; connection may already be torn.
             wsSendErrorTurn(allocator, &ws_conn, 500, "server_error", @errorName(err)) catch {};
@@ -14915,6 +15482,10 @@ fn storeResponse(
     reasoning_text: ?[]const u8,
     tool_calls: ?[]const chat_mod.ToolCall,
     qwen_late_tokens: ?[]const u32,
+    qwen_late_active_tools_json: []const u8,
+    qwen_late_tool_registry_json: []const u8,
+    qwen_late_tool_choice_instruction: []const u8,
+    qwen_late_tools_active: bool,
     durable_instructions: []const u8,
     runtime_instructions: []const u8,
     reasoning_effort: []const u8,
@@ -14996,6 +15567,10 @@ fn storeResponse(
         .qwen_late = qwen_late_tokens != null,
         .qwen_late_has_vision = qwen_late_has_vision,
         .qwen_late_has_non_image_media = qwen_late_has_non_image_media,
+        .qwen_late_active_tools_json = try a.dupe(u8, qwen_late_active_tools_json),
+        .qwen_late_tool_registry_json = try a.dupe(u8, qwen_late_tool_registry_json),
+        .qwen_late_tool_choice_instruction = try a.dupe(u8, qwen_late_tool_choice_instruction),
+        .qwen_late_tools_active = qwen_late_tools_active,
         .durable_instructions = try a.dupe(u8, durable_instructions),
         .runtime_instructions = try a.dupe(u8, runtime_instructions),
         .reasoning_effort = try a.dupe(u8, reasoning_effort),
@@ -15176,6 +15751,16 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+test "utf8BoundaryAtOrBefore does not split a multibyte codepoint" {
+    const text = "logo \xE2\x80\x94 a simple symbol";
+    const dash = std.mem.indexOf(u8, text, "\xE2\x80\x94").?;
+
+    try testing.expectEqual(dash, utf8BoundaryAtOrBefore(text, dash + 1));
+    try testing.expectEqual(dash, utf8BoundaryAtOrBefore(text, dash + 2));
+    try testing.expectEqual(dash + 3, utf8BoundaryAtOrBefore(text, dash + 3));
+    try testing.expectEqual(text.len, utf8BoundaryAtOrBefore(text, text.len));
 }
 
 test "parseJsonFloat returns value when present" {
@@ -15632,6 +16217,41 @@ test "StreamHeartbeat: buffered tokens do NOT reset the deadline" {
     try testing.expect(hb.due(now));
 }
 
+test "Responses progress heartbeat is compact and schema-complete" {
+    const response_id_json = try jsonEscape(testing.allocator, "resp_test");
+    defer testing.allocator.free(response_id_json);
+    const model_json = try jsonEscape(testing.allocator, "model/test");
+    defer testing.allocator.free(model_json);
+
+    const payload = try buildResponsesProgressPayload(
+        testing.allocator,
+        response_id_json,
+        model_json,
+        1_725_000_000,
+    );
+    defer testing.allocator.free(payload);
+
+    // A heartbeat must remain tiny even when the real request carries a large
+    // instruction block or hundreds of kilobytes of tool schemas.
+    try testing.expect(payload.len < 512);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("response.in_progress", root.get("type").?.string);
+
+    const response = root.get("response").?.object;
+    try testing.expectEqualStrings("resp_test", response.get("id").?.string);
+    try testing.expectEqual(@as(i64, 1_725_000_000), response.get("created_at").?.integer);
+    try testing.expectEqualStrings("model/test", response.get("model").?.string);
+    try testing.expectEqualStrings("response", response.get("object").?.string);
+    try testing.expectEqualStrings("in_progress", response.get("status").?.string);
+    try testing.expectEqualStrings("auto", response.get("tool_choice").?.string);
+    try testing.expect(response.get("parallel_tool_calls").?.bool);
+    try testing.expectEqual(@as(usize, 0), response.get("output").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), response.get("tools").?.array.items.len);
+}
+
 test "clampMaxTokens no limit when ctx_size=0" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
@@ -15744,6 +16364,156 @@ test "Hermes qwen-late delta appends current runtime and tool policy only" {
     try testing.expect(std.mem.endsWith(u8, rendered.items, "<|im_start|>assistant\n<think>\n"));
 }
 
+test "Hermes qwen-late reuses structurally unchanged tool policy" {
+    const previous_tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"description\":\"A\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}}}]";
+    const reordered_tools =
+        "[{\"function\":{\"parameters\":{\"properties\":{\"x\":{\"type\":\"string\"}},\"type\":\"object\"},\"description\":\"A\",\"name\":\"alpha\"},\"type\":\"function\"}]";
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+
+    const transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &rendered,
+        previous_tools,
+        previous_tools,
+        "",
+        true,
+        reordered_tools,
+        null,
+    );
+
+    try testing.expectEqual(HermesQwenLateToolTransition.reused, transition);
+    try testing.expectEqual(@as(usize, 0), rendered.items.len);
+}
+
+test "Hermes qwen-late establishes canonical tools when registry is unknown" {
+    const tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"description\":\"A\",\"parameters\":{\"type\":\"object\"}}}]";
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+
+    const transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &rendered,
+        "",
+        "",
+        "",
+        false,
+        tools,
+        null,
+    );
+
+    try testing.expectEqual(HermesQwenLateToolTransition.schema_update, transition);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "# Tools") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Function calls MUST follow") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "\"name\":\"alpha\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Tool schema updates") == null);
+}
+
+test "Hermes qwen-late narrows and re-expands with compact policy" {
+    const alpha =
+        "{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"description\":\"A\",\"parameters\":{\"type\":\"object\"}}}";
+    const beta =
+        "{\"type\":\"function\",\"function\":{\"name\":\"beta\",\"description\":\"B\",\"parameters\":{\"type\":\"object\"}}}";
+    const tools_alpha = "[" ++ alpha ++ "]";
+    const tools_both = "[" ++ alpha ++ "," ++ beta ++ "]";
+
+    var narrowed = std.ArrayList(u8).empty;
+    defer narrowed.deinit(testing.allocator);
+    const narrow_transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &narrowed,
+        tools_both,
+        tools_both,
+        "",
+        true,
+        tools_alpha,
+        null,
+    );
+    try testing.expectEqual(HermesQwenLateToolTransition.policy_only, narrow_transition);
+    try testing.expect(std.mem.indexOf(u8, narrowed.items, "Available function names: [\"alpha\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, narrowed.items, "Tool schema updates") == null);
+    try testing.expect(std.mem.indexOf(u8, narrowed.items, "beta") == null);
+
+    var expanded = std.ArrayList(u8).empty;
+    defer expanded.deinit(testing.allocator);
+    const expand_transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &expanded,
+        tools_alpha,
+        tools_both,
+        "",
+        true,
+        tools_both,
+        null,
+    );
+    try testing.expectEqual(HermesQwenLateToolTransition.policy_only, expand_transition);
+    try testing.expect(std.mem.indexOf(u8, expanded.items, "Available function names: [\"alpha\",\"beta\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, expanded.items, "Tool schema updates") == null);
+}
+
+test "Hermes qwen-late appends only new or changed schemas" {
+    const alpha_old =
+        "{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"description\":\"old\",\"parameters\":{\"type\":\"object\"}}}";
+    const alpha_new =
+        "{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"description\":\"new\",\"parameters\":{\"type\":\"object\"}}}";
+    const beta =
+        "{\"type\":\"function\",\"function\":{\"name\":\"beta\",\"description\":\"stable\",\"parameters\":{\"type\":\"object\"}}}";
+    const previous_tools = "[" ++ alpha_old ++ "," ++ beta ++ "]";
+    const current_tools = "[" ++ alpha_new ++ "," ++ beta ++ "]";
+
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+    const transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &rendered,
+        previous_tools,
+        previous_tools,
+        "",
+        true,
+        current_tools,
+        null,
+    );
+
+    try testing.expectEqual(HermesQwenLateToolTransition.schema_update, transition);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Tool schema updates") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "\"description\":\"new\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "\"description\":\"stable\"") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "Available function names: [\"alpha\",\"beta\"]") != null);
+
+    const merged = try buildHermesQwenLateToolRegistry(
+        testing.allocator,
+        previous_tools,
+        current_tools,
+    );
+    defer testing.allocator.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"description\":\"old\"") == null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"description\":\"new\"") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "\"description\":\"stable\"") != null);
+}
+
+test "Hermes qwen-late explicitly disables inherited tools" {
+    const tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"alpha\",\"parameters\":{\"type\":\"object\"}}}]";
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+
+    const transition = try appendHermesQwenLateToolTransition(
+        testing.allocator,
+        &rendered,
+        tools,
+        tools,
+        "",
+        true,
+        null,
+        null,
+    );
+
+    try testing.expectEqual(HermesQwenLateToolTransition.disabled, transition);
+    try testing.expect(std.mem.indexOf(u8, rendered.items, "No tools are available") != null);
+}
+
 test "Hermes qwen-late expires transient policy and enforces explicit no-tools" {
     var rendered = std.ArrayList(u8).empty;
     defer rendered.deinit(testing.allocator);
@@ -15764,6 +16534,59 @@ test "Hermes qwen-late exact delta rejects media-bearing messages" {
         .images = &images,
     }};
     try testing.expect(!qwenLateDeltaSupported(&messages));
+    try testing.expectEqualStrings("delta_media", qwenLateDeltaRejectReason(&messages).?);
+}
+
+test "Hermes qwen-late exact delta preserves interrupted steering checkpoint" {
+    const messages = [_]chat_mod.Message{
+        .{ .role = "tool", .content = "  launch completed  ", .tool_call_id = "call_launch" },
+        .{ .role = "assistant", .content = "  [response interrupted]  " },
+        .{ .role = "user", .content = "  It launched; inspect the expired trial instead.  " },
+    };
+    try testing.expect(qwenLateDeltaSupported(&messages));
+    try testing.expect(qwenLateDeltaRejectReason(&messages) == null);
+
+    var rendered = std.ArrayList(u8).empty;
+    defer rendered.deinit(testing.allocator);
+    try appendHermesQwenLateMessages(testing.allocator, &rendered, &messages);
+
+    const tool_block = "<|im_start|>user\n<tool_response>\nlaunch completed\n</tool_response><|im_end|>";
+    const checkpoint_block = "<|im_start|>assistant\n[response interrupted]<|im_end|>";
+    const correction_block = "<|im_start|>user\nIt launched; inspect the expired trial instead.<|im_end|>";
+    const tool_at = std.mem.indexOf(u8, rendered.items, tool_block) orelse return error.MissingToolBlock;
+    const checkpoint_at = std.mem.indexOf(u8, rendered.items, checkpoint_block) orelse return error.MissingCheckpointBlock;
+    const correction_at = std.mem.indexOf(u8, rendered.items, correction_block) orelse return error.MissingCorrectionBlock;
+    try testing.expect(tool_at < checkpoint_at);
+    try testing.expect(checkpoint_at < correction_at);
+}
+
+test "Hermes qwen-late exact delta rejects rich assistant checkpoints" {
+    const tool_calls = [_]chat_mod.ToolCall{.{
+        .id = "call_1",
+        .name = "terminal",
+        .arguments = "{}",
+    }};
+    const with_tool_call = [_]chat_mod.Message{.{
+        .role = "assistant",
+        .content = "",
+        .tool_calls = &tool_calls,
+    }};
+    try testing.expect(!qwenLateDeltaSupported(&with_tool_call));
+    try testing.expectEqualStrings(
+        "delta_assistant_tool_calls",
+        qwenLateDeltaRejectReason(&with_tool_call).?,
+    );
+
+    const with_reasoning = [_]chat_mod.Message{.{
+        .role = "assistant",
+        .content = "Visible checkpoint.",
+        .reasoning_content = "Private reasoning.",
+    }};
+    try testing.expect(!qwenLateDeltaSupported(&with_reasoning));
+    try testing.expectEqualStrings(
+        "delta_assistant_metadata",
+        qwenLateDeltaRejectReason(&with_reasoning).?,
+    );
 }
 
 test "Hermes qwen-late exact delta accepts directive-only repair" {
@@ -15851,6 +16674,10 @@ test "deinitGlobalResponseStore frees stored responses" {
         null,
         null,
         &[_]u32{ 1, 2, 3 },
+        "[{\"type\":\"function\",\"function\":{\"name\":\"terminal\"}}]",
+        "[{\"type\":\"function\",\"function\":{\"name\":\"terminal\"}}]",
+        "required",
+        true,
         "durable",
         "runtime",
         "medium",
@@ -15864,6 +16691,9 @@ test "deinitGlobalResponseStore frees stored responses" {
         const stored = store.get("resp_test") orelse return error.TestUnexpectedResult;
         try testing.expect(stored.qwen_late);
         try testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, stored.qwen_late_tokens);
+        try testing.expect(stored.qwen_late_tools_active);
+        try testing.expect(std.mem.indexOf(u8, stored.qwen_late_active_tools_json, "terminal") != null);
+        try testing.expectEqualStrings("required", stored.qwen_late_tool_choice_instruction);
         try testing.expectEqualStrings("durable", stored.durable_instructions);
         try testing.expectEqualStrings("runtime", stored.runtime_instructions);
         try testing.expectEqualStrings("medium", stored.reasoning_effort);
@@ -18004,6 +18834,35 @@ test "contextOverflowMessage: a buffer too small falls back rather than sending 
     try t.expectEqualStrings("Prompt exceeds maximum context length", contextOverflowMessage(&tiny, 999999, 1));
 }
 
+test "contextCapacityErrorBody exposes a structured compress-and-retry contract" {
+    const allocator = std.testing.allocator;
+    const required: u64 = 13_318 * 1024 * 1024;
+    const available: u64 = 13_192 * 1024 * 1024;
+    const body = try contextCapacityErrorBody(
+        allocator,
+        201_369,
+        required,
+        available,
+    );
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        "context_overflow",
+        err.get("code").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "memory_capacity",
+        err.get("reason").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 201_369), err.get("prompt_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(required)), err.get("required_memory_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(available)), err.get("available_memory_bytes").?.integer);
+    try std.testing.expect(err.get("retryable").?.bool);
+}
+
 test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
     const t = std.testing;
     const allocator = t.allocator;
@@ -18259,6 +19118,24 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
     }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
     for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+}
+
+test "Hermes cache leases are explicit and restricted to the main actor" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const main_headers =
+        "POST /v1/responses HTTP/1.1\r\n" ++
+        "X-Hermes-Actor: main\r\n" ++
+        "X-Hermes-Cache-Lease: turn_parent\r\n\r\n";
+    const parsed = parseHermesCacheLease(main_headers, io);
+    try testing.expect(parsed.id != 0);
+    try testing.expect(parsed.deadline_ms > io_util.nowMsMonotonic(io));
+    try testing.expectEqual(parsed.id, hermesCacheLeaseId(main_headers).?);
+
+    const sidecar_headers =
+        "POST /v1/responses HTTP/1.1\r\n" ++
+        "X-Hermes-Actor: conscience\r\n" ++
+        "X-Hermes-Cache-Lease: turn_parent\r\n\r\n";
+    try testing.expectEqual(@as(u64, 0), parseHermesCacheLease(sidecar_headers, io).id);
 }
 
 test "Responses tool-policy conflict metadata is structured and preserves caller metadata" {

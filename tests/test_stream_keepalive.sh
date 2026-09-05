@@ -24,6 +24,9 @@
 #   2. at least one keepalive (`: keepalive` comment / `event: ping`) arrives
 #   3. the tool call still parses — name intact, arguments are valid JSON
 #      (the injected keepalive bytes must not corrupt the SSE stream)
+# Responses additionally requires a repeated schema-valid
+# `response.in_progress` event: OpenAI SDK iterators discard SSE comments, so
+# comment-only transport liveness cannot refresh an event-driven watchdog.
 #
 # A surface whose generation finishes faster than MIN_BUFFER_S never exercised
 # the buffer, so it SKIPs rather than passing vacuously.
