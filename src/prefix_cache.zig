@@ -38,6 +38,17 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
+/// Optional residency class supplied by stateful clients. It is not part of
+/// cache correctness identity: prompt tokens, tool state, media identity, and
+/// quantization remain the complete key. It does scope live lookup candidates
+/// so an actor/conscience miss cannot refresh the opposite role's LRU entry and
+/// evict the active frontier on the following commit.
+pub const CacheRole = enum(u8) {
+    unscoped,
+    actor,
+    conscience,
+};
+
 /// Result of a cache lookup. Tells the caller how many tokens of `prompt_ids`
 /// are already in the live cache after a successful restore — the caller
 /// then prefills only the trailing diverged tokens (`prompt_ids[matched..]`).
@@ -67,6 +78,11 @@ pub const LookupResult = struct {
     lease_owned: bool = false,
 };
 
+const CacheMatch = struct {
+    idx: usize,
+    shared: usize,
+};
+
 const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
     /// Owned by the entry; freed on eviction.
@@ -87,6 +103,9 @@ const Entry = struct {
     /// the cache's active lease is protected from count/byte/pressure
     /// eviction; zero means ordinary LRU state.
     cache_lease_id: u64 = 0,
+    /// Residency class for role-aware lookup selection and eviction. It is
+    /// not part of the token-level correctness identity.
+    cache_role: CacheRole = .unscoped,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -447,13 +466,29 @@ pub const HotPrefixCache = struct {
     /// covers BOTH 4-bit and 8-bit packings: filtering on `Scheme` alone
     /// would let a 4-bit entry alias to an 8-bit slot and crash SDPA on
     /// restore. See `tests/test_kv_quant_per_request.sh`.
-    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
+    fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, vision_key: u64, quant_config: kv_quant.KVQuantConfig) ?CacheMatch {
+        return self.findBestMatchForRole(prompt_ids, has_tools, vision_key, quant_config, .unscoped);
+    }
+
+    fn findBestMatchForRole(
+        self: *const HotPrefixCache,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        quant_config: kv_quant.KVQuantConfig,
+        cache_role: CacheRole,
+    ) ?CacheMatch {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
             if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
+            // Scoped actor/conscience chains may adopt an old unscoped entry,
+            // but never inspect the opposite role. Merely inspecting a weak
+            // common-prefix match updates LRU below; on a two-entry cache that
+            // used to make alternating roles evict each other's live branch.
+            if (cache_role != .unscoped and e.cache_role != .unscoped and e.cache_role != cache_role) continue;
             const max_shared = @min(e.tokens.len, prompt_ids.len);
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
@@ -496,6 +531,7 @@ pub const HotPrefixCache = struct {
             vision_key,
             dflash_target,
             mtp_target,
+            .unscoped,
             0,
             0,
             0,
@@ -513,12 +549,13 @@ pub const HotPrefixCache = struct {
         vision_key: u64,
         dflash_target: ?DflashTarget,
         mtp_target: ?DflashTarget,
+        cache_role: CacheRole,
         cache_lease_id: u64,
         cache_lease_deadline_ms: i64,
         now_ms: i64,
     ) !LookupResult {
         const owns_lease = self.claimLease(cache_lease_id, cache_lease_deadline_ms, now_ms);
-        const match = self.findBestMatch(prompt_ids, has_tools, vision_key, target_cache.config);
+        const match = self.findBestMatchForRole(prompt_ids, has_tools, vision_key, target_cache.config, cache_role);
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
         // (fresh boot, post-eviction). Phase 3 handles hybrid targets too —
@@ -728,6 +765,7 @@ pub const HotPrefixCache = struct {
             tokens,
             has_tools,
             vision_key,
+            .unscoped,
             ssm_cps,
             dflash,
             mtp,
@@ -743,6 +781,7 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         has_tools: bool,
         vision_key: u64,
+        cache_role: CacheRole,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
@@ -763,6 +802,10 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
+            // A scoped request advances its own frontier. Replacing the
+            // opposite role merely because its tokens happen to be a prefix
+            // would discard that role's only warm continuation.
+            if (cache_role != .unscoped and e.cache_role != .unscoped and e.cache_role != cache_role) continue;
             if (e.tokens.len <= tokens.len) {
                 var shared: usize = 0;
                 while (shared < e.tokens.len and e.tokens[shared] == tokens[shared]) shared += 1;
@@ -923,6 +966,7 @@ pub const HotPrefixCache = struct {
             e.mtp_bytes = new_mtp_bytes;
             e.last_used = self.bumpCounter();
             e.cache_lease_id = if (owns_lease) cache_lease_id else 0;
+            e.cache_role = cache_role;
             self.current_kv_bytes += e.kv_bytes;
             if (self.disk != null) self.disk_dirty = true;
             self.logResident();
@@ -930,7 +974,7 @@ pub const HotPrefixCache = struct {
         }
 
         while (self.entries.items.len >= self.max_entries) {
-            if (!self.evictOneLru("count cap", now_ms)) {
+            if (!self.evictOneForIncoming("count cap", cache_role, cache_lease_id, owns_lease, now_ms)) {
                 self.freePendingCommit(tokens_owned, new_snap, ssm_cps, new_dflash, new_mtp);
                 log.info("  [hot-cache] skipped commit: only foreground-leased branch is resident\n", .{});
                 return;
@@ -938,7 +982,7 @@ pub const HotPrefixCache = struct {
         }
         if (self.max_kv_bytes > 0) {
             while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                if (!self.evictOneLru("byte budget", now_ms)) {
+                if (!self.evictOneForIncoming("byte budget", cache_role, cache_lease_id, owns_lease, now_ms)) {
                     self.freePendingCommit(tokens_owned, new_snap, ssm_cps, new_dflash, new_mtp);
                     log.info("  [hot-cache] skipped commit: byte budget is occupied by foreground lease\n", .{});
                     return;
@@ -953,6 +997,7 @@ pub const HotPrefixCache = struct {
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
             .cache_lease_id = if (owns_lease) cache_lease_id else 0,
+            .cache_role = cache_role,
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
             .ssm_checkpoints = ssm_cps,
@@ -1056,35 +1101,77 @@ pub const HotPrefixCache = struct {
         }
     }
 
-    fn evictOneLru(self: *HotPrefixCache, reason: []const u8, now_ms: i64) bool {
+    fn evictionIndexForIncoming(
+        self: *HotPrefixCache,
+        incoming_role: CacheRole,
+        incoming_lease_id: u64,
+        incoming_owns_lease: bool,
+        now_ms: i64,
+    ) ?usize {
         const protected_idx = self.protectedIndex(now_ms);
-        var lru_idx: ?usize = null;
-        var lru_used: u64 = std.math.maxInt(u64);
-        for (self.entries.items, 0..) |*e, i| {
-            if (protected_idx != null and protected_idx.? == i) continue;
-            if (e.last_used < lru_used) {
-                lru_used = e.last_used;
-                lru_idx = i;
+        const priorities = if (incoming_role == .unscoped)
+            [_]CacheRole{ .unscoped, .actor, .conscience }
+        else
+            [_]CacheRole{ incoming_role, .unscoped, if (incoming_role == .actor) .conscience else .actor };
+
+        for (priorities) |role| {
+            var lru_idx: ?usize = null;
+            var lru_used: u64 = std.math.maxInt(u64);
+            for (self.entries.items, 0..) |*e, i| {
+                if (e.cache_role != role) continue;
+                if (protected_idx != null and protected_idx.? == i) {
+                    const supersedes_own_lease = incoming_owns_lease and
+                        incoming_lease_id != 0 and
+                        e.cache_lease_id == incoming_lease_id and
+                        e.cache_role == incoming_role;
+                    if (!supersedes_own_lease) continue;
+                }
+                if (e.last_used < lru_used) {
+                    lru_used = e.last_used;
+                    lru_idx = i;
+                }
             }
+            if (lru_idx != null) return lru_idx;
         }
-        const idx = lru_idx orelse return false;
+        return null;
+    }
+
+    fn evictOneForIncoming(
+        self: *HotPrefixCache,
+        reason: []const u8,
+        incoming_role: CacheRole,
+        incoming_lease_id: u64,
+        incoming_owns_lease: bool,
+        now_ms: i64,
+    ) bool {
+        const idx = self.evictionIndexForIncoming(
+            incoming_role,
+            incoming_lease_id,
+            incoming_owns_lease,
+            now_ms,
+        ) orelse return false;
         var evicted = self.entries.swapRemove(idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
         const had_ssm = evicted.ssm_checkpoints != null;
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
+        const evicted_role = evicted.cache_role;
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);
         if (had_ssm) {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb, ssm_mb,
+            log.info("  [hot-cache] evicted LRU entry ({s}; role={s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
+                reason, @tagName(evicted_role), tokens_len, kv_mb, ssm_mb,
             });
         } else {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb,
+            log.info("  [hot-cache] evicted LRU entry ({s}; role={s}; was {d} tokens, {d:.2} MB)\n", .{
+                reason, @tagName(evicted_role), tokens_len, kv_mb,
             });
         }
         return true;
+    }
+
+    fn evictOneLru(self: *HotPrefixCache, reason: []const u8, now_ms: i64) bool {
+        return self.evictOneForIncoming(reason, .unscoped, 0, false, now_ms);
     }
 
     /// Collapse live RAM state to the newest branch without touching the SSD
@@ -1287,6 +1374,7 @@ test "HotPrefixCache: denied nested request cannot acquire lease at commit" {
         &[_]u32{ 1, 2, 3, 4 },
         false,
         0,
+        .unscoped,
         null,
         null,
         null,
@@ -1351,6 +1439,78 @@ test "HotPrefixCache: count eviction skips the foreground branch" {
     try testing.expect(cache.evictOneLru("count cap", 200));
     try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try testing.expectEqual(@as(u32, 93), cache.entries.items[0].tokens[0]);
+}
+
+test "HotPrefixCache: role eviction keeps actor and conscience frontiers" {
+    var cache = HotPrefixCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testing.expect(cache.claimLease(0xaaa, 10_000, 100));
+
+    for ([_]struct { token: u32, last_used: u64, lease: u64, role: CacheRole }{
+        .{ .token = 11, .last_used = 10, .lease = 0xaaa, .role = .actor },
+        .{ .token = 22, .last_used = 20, .lease = 0, .role = .conscience },
+        .{ .token = 33, .last_used = 1, .lease = 0, .role = .unscoped },
+    }) |item| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{item.token}),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = item.last_used,
+            .cache_lease_id = item.lease,
+            .cache_role = item.role,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+        });
+    }
+
+    // A new owner checkpoint supersedes its own leased actor frontier.
+    try testing.expectEqual(
+        @as(?usize, 0),
+        cache.evictionIndexForIncoming(.actor, 0xaaa, true, 200),
+    );
+    // Conscience advances its own frontier and leaves actor untouched.
+    try testing.expectEqual(
+        @as(?usize, 1),
+        cache.evictionIndexForIncoming(.conscience, 0, false, 200),
+    );
+    // A denied nested actor cannot evict the foreground actor; unrelated
+    // state is discarded before the opposite role frontier.
+    try testing.expectEqual(
+        @as(?usize, 2),
+        cache.evictionIndexForIncoming(.actor, 0xbbbb, false, 200),
+    );
+}
+
+test "HotPrefixCache: scoped lookup cannot refresh the opposite role" {
+    var cache = HotPrefixCache.init(testing.allocator, 3);
+    defer cache.deinit();
+
+    for ([_]struct { tokens: []const u32, last_used: u64, role: CacheRole }{
+        .{ .tokens = &[_]u32{ 1, 2, 3, 4 }, .last_used = 20, .role = .actor },
+        .{ .tokens = &[_]u32{ 1, 2, 9, 9 }, .last_used = 10, .role = .actor },
+    }) |item| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, item.tokens),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = item.last_used,
+            .cache_role = item.role,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+        });
+    }
+
+    const query = &[_]u32{ 1, 2, 3, 8 };
+    try testing.expect(cache.findBestMatchForRole(
+        query,
+        false,
+        0,
+        kv_quant.KVQuantConfig.dense,
+        .conscience,
+    ) == null);
+    const actor = cache.findBestMatchForRole(query, false, 0, kv_quant.KVQuantConfig.dense, .actor).?;
+    try testing.expectEqual(@as(usize, 0), actor.idx);
+    try testing.expectEqual(@as(usize, 3), actor.shared);
 }
 
 test "HotPrefixCache: findBestMatch returns longest shared prefix" {

@@ -5820,7 +5820,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, null, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, .{}, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, null, .unscoped, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -6128,6 +6128,7 @@ fn nonStreamingViaScheduler(
     cached_tokens: u32,
     has_tools: bool,
     cache_has_tools: ?bool,
+    cache_role: prefix_cache_mod.CacheRole,
     enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
@@ -6153,6 +6154,7 @@ fn nonStreamingViaScheduler(
         .cached_tokens = cached_tokens,
         .has_tools = has_tools,
         .cache_has_tools = cache_has_tools,
+        .cache_role = cache_role,
         .cache_lease_id = cache_lease.id,
         .cache_lease_deadline_ms = cache_lease.deadline_ms,
         .enable_thinking = enable_thinking,
@@ -6306,7 +6308,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, .unscoped, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -11460,7 +11462,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, null, .unscoped, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, .{}, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -13869,6 +13871,7 @@ fn handleResponses(
             .cached_tokens = 0,
             .has_tools = active_has_tools,
             .cache_has_tools = if (qwen_late_used) false else null,
+            .cache_role = responsesCacheRole(root),
             .cache_lease_id = cache_lease.id,
             .cache_lease_deadline_ms = cache_lease.deadline_ms,
             .enable_thinking = enable_thinking,
@@ -14182,7 +14185,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, if (qwen_late_used) false else null, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, cache_lease, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, if (qwen_late_used) false else null, responsesCacheRole(root), enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, cache_lease, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -14965,6 +14968,16 @@ fn renderResponsesMetadataEcho(allocator: std.mem.Allocator, root: std.json.Obje
         return try buf.toOwnedSlice(allocator);
     };
     return try allocator.dupe(u8, "{}");
+}
+
+fn responsesCacheRole(root: std.json.ObjectMap) prefix_cache_mod.CacheRole {
+    const metadata = root.get("metadata") orelse return .unscoped;
+    if (metadata != .object) return .unscoped;
+    const value = metadata.object.get("hermes_cache_role") orelse return .unscoped;
+    if (value != .string) return .unscoped;
+    if (std.mem.eql(u8, value.string, "actor")) return .actor;
+    if (std.mem.eql(u8, value.string, "conscience")) return .conscience;
+    return .unscoped;
 }
 
 fn renderResponsesToolPolicyConflictMetadata(
@@ -19166,6 +19179,36 @@ test "Responses tool-policy conflict metadata is structured and preserves caller
     try std.testing.expectEqual(@as(usize, 2), parsed_names.len);
     try std.testing.expectEqualStrings("write_file", parsed_names[0].string);
     try std.testing.expectEqualStrings("terminal", parsed_names[1].string);
+}
+
+test "Responses cache role comes only from structured metadata" {
+    const allocator = std.testing.allocator;
+    const parsed_actor = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"metadata\":{\"hermes_cache_role\":\"actor\"}}",
+        .{},
+    );
+    defer parsed_actor.deinit();
+    try std.testing.expectEqual(prefix_cache_mod.CacheRole.actor, responsesCacheRole(parsed_actor.value.object));
+
+    const parsed_conscience = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"metadata\":{\"hermes_cache_role\":\"conscience\"}}",
+        .{},
+    );
+    defer parsed_conscience.deinit();
+    try std.testing.expectEqual(prefix_cache_mod.CacheRole.conscience, responsesCacheRole(parsed_conscience.value.object));
+
+    const parsed_unknown = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"metadata\":{\"hermes_cache_role\":\"delegate\"}}",
+        .{},
+    );
+    defer parsed_unknown.deinit();
+    try std.testing.expectEqual(prefix_cache_mod.CacheRole.unscoped, responsesCacheRole(parsed_unknown.value.object));
 }
 
 test "the 413 names both counts it compared" {

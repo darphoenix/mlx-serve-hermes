@@ -243,6 +243,9 @@ pub const SubmitParams = struct {
     /// Token-authentic late-tool renderers may pin this because their schema
     /// already participates in exact prompt-token matching.
     cache_has_tools: ?bool = null,
+    /// Residency-only class for the hot prefix cache. It does not participate
+    /// in matching and therefore cannot relax cache correctness.
+    cache_role: prefix_cache_mod.CacheRole = .unscoped,
     /// Exclusive foreground-turn cache lease. Zero means ordinary LRU work.
     /// The deadline is monotonic milliseconds and exists only as a crash
     /// fallback; Hermes releases the lease explicitly when the turn ends.
@@ -388,6 +391,7 @@ pub const Slot = struct {
     timeout_ns: u64,
     has_tools: bool,
     cache_has_tools: bool = false,
+    cache_role: prefix_cache_mod.CacheRole = .unscoped,
     cache_lease_id: u64 = 0,
     cache_lease_deadline_ms: i64 = 0,
     /// Lease ownership latched during prefix-cache lookup. A nested request
@@ -571,6 +575,7 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .cache_has_tools = resolvedCacheHasTools(params.has_tools, params.cache_has_tools),
+            .cache_role = params.cache_role,
             .cache_lease_id = params.cache_lease_id,
             .cache_lease_deadline_ms = params.cache_lease_deadline_ms,
             .cache_lease_owned = false,
@@ -4644,6 +4649,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         total_tokens,
         slot.cache_has_tools,
         slot.vision_key,
+        slot.cache_role,
         ssm_cps_opt,
         dflash_commit,
         mtp_commit,
@@ -4695,6 +4701,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         slot.full_prompt[0..len],
         slot.cache_has_tools,
         slot.vision_key,
+        slot.cache_role,
         null,
         null,
         null,
@@ -5386,6 +5393,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.vision_key,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base } else null,
+                slot.cache_role,
                 slot.cache_lease_id,
                 slot.cache_lease_deadline_ms,
                 io_util.nowMsMonotonic(sch.io),
@@ -6163,7 +6171,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
         calls += 1;
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, null, false, use_pld") != null);
+            std.mem.indexOf(u8, line, ", false, null, .unscoped, false, use_pld") != null);
     }
     try testing.expectEqual(@as(usize, 4), calls);
 }
